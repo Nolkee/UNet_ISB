@@ -1,189 +1,191 @@
-# U-Net: Semantic segmentation with PyTorch
-<a href="#"><img src="https://img.shields.io/github/actions/workflow/status/milesial/PyTorch-UNet/main.yml?logo=github&style=for-the-badge" /></a>
-<a href="https://hub.docker.com/r/milesial/unet"><img src="https://img.shields.io/badge/docker%20image-available-blue?logo=Docker&style=for-the-badge" /></a>
-<a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-v1.13+-red.svg?logo=PyTorch&style=for-the-badge" /></a>
-<a href="#"><img src="https://img.shields.io/badge/python-v3.6+-blue.svg?logo=python&style=for-the-badge" /></a>
+# UNet_ISB
 
-![input and output for a random image in the test dataset](https://i.imgur.com/GD8FcB7.png)
+`UNet_ISB` 是一个面向科研复现与增量改造的代码仓库，用于实现参考文档中的 SB-EQ 生成器三段训练策略。
 
+当前仓库以 [`milesial/pytorch-unet`](https://github.com/milesial/pytorch-unet) 为 U-Net 基线，在其上加入第一阶段所需的双分支编码、`b/r` 解耦、动态掩码和 EQ 解码逻辑。仓库同时保留了原始分割版 `UNet`，并新增一条独立的 restoration 训练路径。
 
-Customized implementation of the [U-Net](https://arxiv.org/abs/1505.04597) in PyTorch for Kaggle's [Carvana Image Masking Challenge](https://www.kaggle.com/c/carvana-image-masking-challenge) from high definition images.
+## 当前状态
 
-- [Quick start](#quick-start)
-  - [Without Docker](#without-docker)
-  - [With Docker](#with-docker)
-- [Description](#description)
-- [Usage](#usage)
-  - [Docker](#docker)
-  - [Training](#training)
-  - [Prediction](#prediction)
-- [Weights & Biases](#weights--biases)
-- [Pretrained model](#pretrained-model)
-- [Data](#data)
+- 已完成：第一阶段生成器代码骨架与训练入口
+- 未完成：第二阶段无配对 SB + PatchGAN
+- 未完成：第三阶段完整 barycenter regularization
+- 重要边界：当前实现是“基于 U-Net 的第一阶段生成器改造”，不是完整的 SB/I2SB 训练框架
 
-## Quick start
+这点必须说清楚。参考 PPT 中“骨干网络：SB”这一条，在当前仓库里还没有被完整复现。现阶段实现的是：
 
-### Without Docker
+- `x(t_i)` 与 `t_i` 条件下的时间条件生成器
+- 双分支编码与等变解码
+- `b/r` 初步解耦
+- 第一阶段细节保持损失
 
-1. [Install CUDA](https://developer.nvidia.com/cuda-downloads)
+如果你的目标是“完全等价于文档中的 SB 主干训练流程”，那么第二轮代码工作必须继续把 SB 轨迹采样、桥过程训练和后续两阶段补齐。
 
-2. [Install PyTorch 1.13 or later](https://pytorch.org/get-started/locally/)
+## 第一阶段审计结论
 
-3. Install dependencies
+### 已对齐的点
+
+根据内部参考资料《三段训练策略.docx》与《SB-EQ整体架构.pptx》，当前第一阶段已经实现并且代码上可对应的点如下：
+
+1. 双分支编码与等变解码的基本映射  
+   实现位置：
+   [sb_eq_unet_model.py](unet/sb_eq_unet_model.py)
+   [sb_eq_parts.py](unet/sb_eq_parts.py)
+
+2. `b/r` 初步解耦  
+   实现位置：
+   [sb_eq_unet_model.py](unet/sb_eq_unet_model.py)
+   [sb_eq_parts.py](unet/sb_eq_parts.py)
+
+3. 在输入结构上保持细节与边缘一致  
+   实现位置：
+   [restoration_losses.py](utils/restoration_losses.py)
+   包含：
+   - Charbonnier 重建项
+   - 高频梯度保持项
+   - PatchNCE 结构保持项
+
+4. 第一阶段不启用判别器与完整 barycenter regularization  
+   当前仓库中没有接入 PatchGAN，也没有实现 `L_adv` 和 `L_WB`，这与第一阶段要求一致。
+
+5. 动态掩码三头输出  
+   当前实现已包含：
+   - `mask_eq`
+   - `mask_res`
+   - `mask_reg`
+
+6. 调制特征与 skip 融合  
+   当前实现已包含：
+   - `z' = b + alpha * (r * mask_res)`
+   - `skip = mask_eq * fe + (1 - mask_eq) * fc`
+
+### 我修复过的正确性问题
+
+这次审计和修补里，已经补掉以下会影响第一阶段结论可信度的实现问题：
+
+- `manifest` 相对路径解析  
+  现在优先按 `manifest` 所在目录解析，避免训练清单在服务器上错指路径。  
+  位置：
+  [restoration_data_loading.py](utils/restoration_data_loading.py)
+
+- `IRC` 在没有标签时静默失效  
+  现在如果 `--irc-weight > 0` 但训练数据没有 `degradation_label`，脚本会直接报错，而不是假装在做残差对比学习。  
+  位置：
+  [train_stage1_restoration.py](train_stage1_restoration.py)
+
+- checkpointing 接口原本是坏的  
+  现在已改成真正的 gradient checkpoint wrapper。  
+  位置：
+  [checkpointing.py](unet/checkpointing.py)
+  [unet_model.py](unet/unet_model.py)
+  [sb_eq_unet_model.py](unet/sb_eq_unet_model.py)
+
+- `IRC` projector 依赖懒初始化  
+  已改成显式特征维度初始化，避免 checkpoint 恢复时出现不透明状态。  
+  位置：
+  [restoration_losses.py](utils/restoration_losses.py)
+
+- `--load` 只加载模型不恢复训练上下文  
+  现在会恢复 `optimizer`、`criterion`、`epoch` 和已有最优验证值。  
+  位置：
+  [train_stage1_restoration.py](train_stage1_restoration.py)
+
+### 仍然不能虚假宣称“完美无误”的点
+
+下面这些边界我必须明确写出来：
+
+1. 当前不是完整 SB backbone  
+   这是最重要的事实。文档说“骨干网络：SB”，而当前仓库仍然是“以 U-Net 为骨架的第一阶段生成器实现”。如果你要求的是完整 SB 训练闭环，这一项还没完成。
+
+2. 当前 EQ 分支是离散 `C4` 权重共享近似  
+   这是为了避免额外 steerable/e2cnn 依赖，先把第一阶段逻辑落成可训练代码。它是工程近似，不应写成“与参考论文完全等价的旋转等变实现”。
+
+3. 我没有在本机做训练实跑  
+   按你的要求，没有在本机启动训练。代码已经做过静态审计和逻辑修补，但最终正确性仍然需要你在远程 Ubuntu 服务器上用真实数据跑通一次前向和训练。
+
+## 仓库结构
+
+- [train_stage1_restoration.py](train_stage1_restoration.py)
+  第一阶段训练入口
+- [unet/sb_eq_unet_model.py](unet/sb_eq_unet_model.py)
+  第一阶段生成器
+- [unet/sb_eq_parts.py](unet/sb_eq_parts.py)
+  双分支编码、动态掩码、EQ 上采样等模块
+- [utils/restoration_data_loading.py](utils/restoration_data_loading.py)
+  配对 restoration 数据集
+- [utils/restoration_losses.py](utils/restoration_losses.py)
+  第一阶段损失
+- [README_stage1_sb_eq.md](README_stage1_sb_eq.md)
+  第一阶段简版说明
+
+## 数据格式
+
+最简单的数据组织方式：
+
+```text
+train_inputs/
+  sample_0001.png
+train_targets/
+  sample_0001.png
+val_inputs/
+val_targets/
+```
+
+如果你有时间步和退化标签，建议使用 `manifest`：
+
+```text
+input_path,target_path,timestep,degradation_type,degradation_level,degradation_label
+train_inputs/sample_0001.png,train_targets/sample_0001.png,0.45,noise,25,0
+```
+
+注意：
+
+- 如果不提供 `manifest`，所有样本会使用同一个 `--default-timestep`
+- 如果 `--irc-weight > 0`，训练集必须提供有效的 `degradation_label`
+
+## 远程 Ubuntu 训练
+
+下面的命令应该在你的远程服务器上运行，而不是本机：
+
 ```bash
-pip install -r requirements.txt
+cd /path/to/UNet_ISB_repo
+python train_stage1_restoration.py \
+  --train-input-dir /path/to/train/inputs \
+  --train-target-dir /path/to/train/targets \
+  --val-input-dir /path/to/val/inputs \
+  --val-target-dir /path/to/val/targets \
+  --save-dir /path/to/checkpoints_stage1 \
+  --epochs 100 \
+  --batch-size 4 \
+  --learning-rate 2e-4 \
+  --amp
 ```
 
-4. Download the data and run training:
+如果你有清单文件：
+
 ```bash
-bash scripts/download_data.sh
-python train.py --amp
+python train_stage1_restoration.py \
+  --train-input-dir /path/to/train/inputs \
+  --train-target-dir /path/to/train/targets \
+  --train-manifest /path/to/train_manifest.csv \
+  --val-input-dir /path/to/val/inputs \
+  --val-target-dir /path/to/val/targets \
+  --val-manifest /path/to/val_manifest.csv \
+  --save-dir /path/to/checkpoints_stage1 \
+  --epochs 100 \
+  --batch-size 4 \
+  --learning-rate 2e-4 \
+  --amp
 ```
 
-### With Docker
+## 下一步
 
-1. [Install Docker 19.03 or later:](https://docs.docker.com/get-docker/)
-```bash
-curl https://get.docker.com | sh && sudo systemctl --now enable docker
-```
-2. [Install the NVIDIA container toolkit:](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
-```bash
-distribution=$(. /etc/os-release;echo $ID$VERSION_ID) \
-   && curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | sudo apt-key add - \
-   && curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | sudo tee /etc/apt/sources.list.d/nvidia-docker.list
-sudo apt-get update
-sudo apt-get install -y nvidia-docker2
-sudo systemctl restart docker
-```
-3. [Download and run the image:](https://hub.docker.com/repository/docker/milesial/unet)
-```bash
-sudo docker run --rm --shm-size=8g --ulimit memlock=-1 --gpus all -it milesial/unet
-```
+如果你的目标是继续向参考方案收敛，下一步应该做的是：
 
-4. Download the data and run training:
-```bash
-bash scripts/download_data.sh
-python train.py --amp
-```
+1. 在当前第一阶段代码上接入真正的 SB 轨迹/时间步采样流程
+2. 实现第二阶段的无配对 SB + PatchGAN
+3. 实现第三阶段的完整 barycenter regularization
 
-## Description
-This model was trained from scratch with 5k images and scored a [Dice coefficient](https://en.wikipedia.org/wiki/S%C3%B8rensen%E2%80%93Dice_coefficient) of 0.988423 on over 100k test images.
+## 致谢
 
-It can be easily used for multiclass segmentation, portrait segmentation, medical segmentation, ...
-
-
-## Usage
-**Note : Use Python 3.6 or newer**
-
-### Docker
-
-A docker image containing the code and the dependencies is available on [DockerHub](https://hub.docker.com/repository/docker/milesial/unet).
-You can download and jump in the container with ([docker >=19.03](https://docs.docker.com/get-docker/)):
-
-```console
-docker run -it --rm --shm-size=8g --ulimit memlock=-1 --gpus all milesial/unet
-```
-
-
-### Training
-
-```console
-> python train.py -h
-usage: train.py [-h] [--epochs E] [--batch-size B] [--learning-rate LR]
-                [--load LOAD] [--scale SCALE] [--validation VAL] [--amp]
-
-Train the UNet on images and target masks
-
-optional arguments:
-  -h, --help            show this help message and exit
-  --epochs E, -e E      Number of epochs
-  --batch-size B, -b B  Batch size
-  --learning-rate LR, -l LR
-                        Learning rate
-  --load LOAD, -f LOAD  Load model from a .pth file
-  --scale SCALE, -s SCALE
-                        Downscaling factor of the images
-  --validation VAL, -v VAL
-                        Percent of the data that is used as validation (0-100)
-  --amp                 Use mixed precision
-```
-
-By default, the `scale` is 0.5, so if you wish to obtain better results (but use more memory), set it to 1.
-
-Automatic mixed precision is also available with the `--amp` flag. [Mixed precision](https://arxiv.org/abs/1710.03740) allows the model to use less memory and to be faster on recent GPUs by using FP16 arithmetic. Enabling AMP is recommended.
-
-
-### Prediction
-
-After training your model and saving it to `MODEL.pth`, you can easily test the output masks on your images via the CLI.
-
-To predict a single image and save it:
-
-`python predict.py -i image.jpg -o output.jpg`
-
-To predict a multiple images and show them without saving them:
-
-`python predict.py -i image1.jpg image2.jpg --viz --no-save`
-
-```console
-> python predict.py -h
-usage: predict.py [-h] [--model FILE] --input INPUT [INPUT ...] 
-                  [--output INPUT [INPUT ...]] [--viz] [--no-save]
-                  [--mask-threshold MASK_THRESHOLD] [--scale SCALE]
-
-Predict masks from input images
-
-optional arguments:
-  -h, --help            show this help message and exit
-  --model FILE, -m FILE
-                        Specify the file in which the model is stored
-  --input INPUT [INPUT ...], -i INPUT [INPUT ...]
-                        Filenames of input images
-  --output INPUT [INPUT ...], -o INPUT [INPUT ...]
-                        Filenames of output images
-  --viz, -v             Visualize the images as they are processed
-  --no-save, -n         Do not save the output masks
-  --mask-threshold MASK_THRESHOLD, -t MASK_THRESHOLD
-                        Minimum probability value to consider a mask pixel white
-  --scale SCALE, -s SCALE
-                        Scale factor for the input images
-```
-You can specify which model file to use with `--model MODEL.pth`.
-
-## Weights & Biases
-
-The training progress can be visualized in real-time using [Weights & Biases](https://wandb.ai/).  Loss curves, validation curves, weights and gradient histograms, as well as predicted masks are logged to the platform.
-
-When launching a training, a link will be printed in the console. Click on it to go to your dashboard. If you have an existing W&B account, you can link it
- by setting the `WANDB_API_KEY` environment variable. If not, it will create an anonymous run which is automatically deleted after 7 days.
-
-
-## Pretrained model
-A [pretrained model](https://github.com/milesial/Pytorch-UNet/releases/tag/v3.0) is available for the Carvana dataset. It can also be loaded from torch.hub:
-
-```python
-net = torch.hub.load('milesial/Pytorch-UNet', 'unet_carvana', pretrained=True, scale=0.5)
-```
-Available scales are 0.5 and 1.0.
-
-## Data
-The Carvana data is available on the [Kaggle website](https://www.kaggle.com/c/carvana-image-masking-challenge/data).
-
-You can also download it using the helper script:
-
-```
-bash scripts/download_data.sh
-```
-
-The input images and target masks should be in the `data/imgs` and `data/masks` folders respectively (note that the `imgs` and `masks` folder should not contain any sub-folder or any other files, due to the greedy data-loader). For Carvana, images are RGB and masks are black and white.
-
-You can use your own dataset as long as you make sure it is loaded properly in `utils/data_loading.py`.
-
-
----
-
-Original paper by Olaf Ronneberger, Philipp Fischer, Thomas Brox:
-
-[U-Net: Convolutional Networks for Biomedical Image Segmentation](https://arxiv.org/abs/1505.04597)
-
-![network architecture](https://i.imgur.com/jeDVpqF.png)
+- U-Net 基线来自 [`milesial/pytorch-unet`](https://github.com/milesial/pytorch-unet)
+- 本仓库当前第一阶段实现是在该基线上做研究改造，不代表上游仓库本身提供了 SB-EQ 训练逻辑

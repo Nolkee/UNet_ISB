@@ -24,6 +24,7 @@ def create_argparser():
     parser.add_argument('--val-manifest', type=str, default='', help='Optional val CSV/TSV manifest')
     parser.add_argument('--save-dir', type=str, default='checkpoints_stage1', help='Checkpoint output directory')
     parser.add_argument('--load', type=str, default='', help='Resume from checkpoint')
+    parser.add_argument('--device', type=str, default='auto', help='Training device, e.g. cuda, cuda:0, cpu')
 
     parser.add_argument('--epochs', '-e', type=int, default=100)
     parser.add_argument('--batch-size', '-b', dest='batch_size', type=int, default=4)
@@ -44,6 +45,8 @@ def create_argparser():
 
     parser.add_argument('--image-size', type=int, default=256, help='Resize images before cropping')
     parser.add_argument('--crop-size', type=int, default=256, help='Training/validation crop size')
+    parser.add_argument('--default-timestep', type=float, default=1.0,
+                        help='Fallback timestep used when no manifest is provided')
     parser.add_argument('--save-every', type=int, default=5)
 
     parser.add_argument('--reconstruction-weight', type=float, default=1.0)
@@ -76,6 +79,16 @@ def summarize_metrics(history):
     return {key: sum(item[key] for item in history) / len(history) for key in keys}
 
 
+def resolve_device(device_arg: str) -> torch.device:
+    if device_arg != 'auto':
+        return torch.device(device_arg)
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return torch.device('mps')
+    return torch.device('cpu')
+
+
 def evaluate(model, criterion, loader, device, amp):
     model.eval()
     criterion.eval()
@@ -95,14 +108,23 @@ def evaluate(model, criterion, loader, device, amp):
     return summarize_metrics(history)
 
 
-def train_model(model, criterion, optimizer, train_loader, val_loader, device, args):
+def train_model(
+    model,
+    criterion,
+    optimizer,
+    train_loader,
+    val_loader,
+    device,
+    args,
+    start_epoch: int = 1,
+    best_val: float = float('inf'),
+):
     scaler = torch.amp.GradScaler('cuda', enabled=args.amp and device.type == 'cuda')
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     (save_dir / 'train_args.json').write_text(json.dumps(vars(args), indent=2))
 
-    best_val = float('inf')
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         criterion.train()
         epoch_history = []
@@ -158,7 +180,7 @@ def train_model(model, criterion, optimizer, train_loader, val_loader, device, a
 def main():
     args = create_argparser().parse_args()
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = resolve_device(args.device)
     logging.info('Using device %s', device)
 
     model = SBEQUNet(
@@ -176,6 +198,8 @@ def main():
     if args.load:
         checkpoint = torch.load(args.load, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        if 'criterion_state_dict' in checkpoint:
+            logging.info('Checkpoint contains criterion state and will be restored after criterion init')
         logging.info('Loaded checkpoint from %s', args.load)
 
     criterion = Stage1RestorationLoss(
@@ -191,13 +215,25 @@ def main():
         max_patches=args.max_patches,
         contrastive_temperature=args.contrastive_temperature,
         projector_dim=args.projector_dim,
+        residual_feature_dim=args.base_channels * 16 // (2 if args.bilinear else 1),
     ).to(device)
+
+    if args.load and 'criterion_state_dict' in checkpoint:
+        criterion.load_state_dict(checkpoint['criterion_state_dict'])
 
     optimizer = optim.AdamW(
         list(model.parameters()) + list(criterion.parameters()),
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
+    start_epoch = 1
+    best_val = float('inf')
+    if args.load and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = int(checkpoint.get('epoch', 0)) + 1
+        loaded_val = checkpoint.get('val_metrics', {})
+        if loaded_val:
+            best_val = float(loaded_val.get('loss_total', best_val))
 
     train_set = PairedRestorationDataset(
         input_dir=args.train_input_dir,
@@ -205,10 +241,21 @@ def main():
         image_size=args.image_size,
         crop_size=args.crop_size,
         manifest=args.train_manifest or None,
+        default_timestep=args.default_timestep,
         in_channels=args.in_channels,
         is_train=True,
     )
-    loader_args = dict(batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True)
+    if args.irc_weight > 0 and not train_set.has_valid_labels:
+        raise ValueError(
+            'IRC loss requires degradation labels, but no valid labels were found in the training dataset. '
+            'Provide degradation_label in the manifest or set --irc-weight 0.'
+        )
+    if not train_set.uses_manifest:
+        logging.warning(
+            'No training manifest provided: all samples will use default timestep %.4f and IRC labels will be absent.',
+            args.default_timestep,
+        )
+    loader_args = dict(batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=device.type == 'cuda')
     train_loader = DataLoader(train_set, shuffle=True, **loader_args)
 
     val_loader = None
@@ -219,12 +266,31 @@ def main():
             image_size=args.image_size,
             crop_size=args.crop_size,
             manifest=args.val_manifest or None,
+            default_timestep=args.default_timestep,
             in_channels=args.in_channels,
             is_train=False,
         )
         val_loader = DataLoader(val_set, shuffle=False, **loader_args)
 
-    train_model(model, criterion, optimizer, train_loader, val_loader, device, args)
+    if start_epoch > args.epochs:
+        logging.info('Checkpoint epoch %d already meets or exceeds requested epochs=%d; nothing to train.',
+                     start_epoch - 1, args.epochs)
+        return
+
+    if start_epoch > 1:
+        logging.info('Resuming stage-1 training from epoch %d', start_epoch)
+
+    train_model(
+        model,
+        criterion,
+        optimizer,
+        train_loader,
+        val_loader,
+        device,
+        args,
+        start_epoch=start_epoch,
+        best_val=best_val,
+    )
 
 
 if __name__ == '__main__':

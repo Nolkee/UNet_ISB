@@ -38,6 +38,7 @@ class PairedRestorationDataset(Dataset):
         image_size: int | None = None,
         crop_size: int | None = None,
         manifest: str | Path | None = None,
+        default_timestep: float = 1.0,
         in_channels: int = 3,
         is_train: bool = True,
     ) -> None:
@@ -46,10 +47,13 @@ class PairedRestorationDataset(Dataset):
         self.manifest = Path(manifest) if manifest else None
         self.image_size = image_size
         self.crop_size = crop_size
+        self.default_timestep = default_timestep
         self.in_channels = in_channels
         self.is_train = is_train
         self.label_map: dict[str, int] = {}
         self.samples = self._build_samples()
+        self.has_valid_labels = any(sample.label >= 0 for sample in self.samples)
+        self.uses_manifest = self.manifest is not None
         if not self.samples:
             raise RuntimeError(f'No paired restoration samples found in {self.input_dir} and {self.target_dir}')
 
@@ -63,7 +67,7 @@ class PairedRestorationDataset(Dataset):
             RestorationSample(
                 input_path=input_files[name],
                 target_path=target_files[name],
-                timestep=1.0,
+                timestep=self.default_timestep,
                 label=-1,
                 sample_id=Path(name).stem,
             )
@@ -72,12 +76,13 @@ class PairedRestorationDataset(Dataset):
 
     def _samples_from_manifest(self, manifest: Path) -> list[RestorationSample]:
         delimiter = '\t' if manifest.suffix.lower() == '.tsv' else ','
+        manifest_root = manifest.parent
         samples = []
         with manifest.open('r', newline='') as handle:
             reader = csv.DictReader(handle, delimiter=delimiter)
             for row in reader:
-                input_path = self._resolve_path(self.input_dir, row['input_path'])
-                target_path = self._resolve_path(self.target_dir, row['target_path'])
+                input_path = self._resolve_path(self.input_dir, row['input_path'], manifest_root)
+                target_path = self._resolve_path(self.target_dir, row['target_path'], manifest_root)
                 label = self._resolve_label(
                     row.get('degradation_label'),
                     row.get('degradation_type'),
@@ -87,16 +92,20 @@ class PairedRestorationDataset(Dataset):
                     RestorationSample(
                         input_path=input_path,
                         target_path=target_path,
-                        timestep=float(row.get('timestep', 1.0)),
+                        timestep=float(row.get('timestep', self.default_timestep)),
                         label=label,
                         sample_id=input_path.stem,
                     )
                 )
         return samples
 
-    def _resolve_path(self, default_root: Path, raw_path: str) -> Path:
+    def _resolve_path(self, default_root: Path, raw_path: str, manifest_root: Path) -> Path:
         path = Path(raw_path)
-        return path if path.is_absolute() else default_root / path
+        if path.is_absolute():
+            return path
+        if (manifest_root / path).exists():
+            return manifest_root / path
+        return default_root / path
 
     def _resolve_label(self, raw_label: str | None, degradation_type: str | None, degradation_level: str | None) -> int:
         if raw_label not in {None, ''}:

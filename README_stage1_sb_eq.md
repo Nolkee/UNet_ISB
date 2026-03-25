@@ -1,6 +1,11 @@
 # Stage-1 SB-EQ Restoration on Top of `pytorch-unet`
 
-This folder keeps the original `milesial/pytorch-unet` segmentation baseline intact and adds a new stage-1 restoration path:
+This folder keeps the original `milesial/pytorch-unet` segmentation baseline intact and adds a new stage-1 restoration path.
+
+Important boundary:
+
+- this is a U-Net-based stage-1 generator implementation
+- it is not yet the full SB/I2SB backbone described in the long-term target architecture
 
 - `unet/sb_eq_unet_model.py`: stage-1 generator
 - `unet/sb_eq_parts.py`: dual-branch encoder, barycenter/residual disentanglement, dynamic masks, EQ decoder blocks
@@ -46,3 +51,8 @@ If you have timestep / degradation metadata, provide manifests with columns:
 ```text
 input_path,target_path,timestep,degradation_type,degradation_level,degradation_label
 ```
+
+Notes:
+
+- if no manifest is provided, all samples use the same `--default-timestep`
+- if `--irc-weight > 0`, the training manifest must provide `degradation_label`

@@ -69,11 +69,11 @@ class PatchNCELoss(nn.Module):
 
 
 class ResidualContrastiveLoss(nn.Module):
-    def __init__(self, temperature: float = 0.1, projector_dim: int = 128) -> None:
+    def __init__(self, feature_dim: int, temperature: float = 0.1, projector_dim: int = 128) -> None:
         super().__init__()
         self.temperature = temperature
         self.projector = nn.Sequential(
-            nn.LazyLinear(projector_dim),
+            nn.Linear(feature_dim, projector_dim),
             nn.SiLU(),
             nn.Linear(projector_dim, projector_dim),
         )
@@ -117,6 +117,7 @@ class Stage1RestorationLoss(nn.Module):
         max_patches: int = 128,
         contrastive_temperature: float = 0.1,
         projector_dim: int = 128,
+        residual_feature_dim: int = 1024,
     ) -> None:
         super().__init__()
         self.reconstruction_weight = reconstruction_weight
@@ -128,7 +129,7 @@ class Stage1RestorationLoss(nn.Module):
         self.reconstruction = CharbonnierLoss(charbonnier_eps)
         self.high_frequency = HighFrequencyDetailLoss()
         self.patch_nce = PatchNCELoss(patch_size, patch_stride, patch_temperature, max_patches)
-        self.irc = ResidualContrastiveLoss(contrastive_temperature, projector_dim)
+        self.irc = ResidualContrastiveLoss(residual_feature_dim, contrastive_temperature, projector_dim)
 
     def forward(self, outputs: dict[str, torch.Tensor | list[torch.Tensor]], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         prediction = outputs['prediction']
