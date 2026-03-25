@@ -1,0 +1,231 @@
+import argparse
+import json
+import logging
+from pathlib import Path
+
+import torch
+from torch import optim
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from unet import SBEQUNet
+from utils.restoration_data_loading import PairedRestorationDataset
+from utils.restoration_losses import Stage1RestorationLoss
+
+
+def create_argparser():
+    parser = argparse.ArgumentParser(description='Train stage-1 SB-EQ U-Net for paired restoration')
+
+    parser.add_argument('--train-input-dir', type=str, required=True, help='Directory with degraded/noisy inputs')
+    parser.add_argument('--train-target-dir', type=str, required=True, help='Directory with clean targets')
+    parser.add_argument('--val-input-dir', type=str, default='', help='Validation input directory')
+    parser.add_argument('--val-target-dir', type=str, default='', help='Validation target directory')
+    parser.add_argument('--train-manifest', type=str, default='', help='Optional train CSV/TSV manifest')
+    parser.add_argument('--val-manifest', type=str, default='', help='Optional val CSV/TSV manifest')
+    parser.add_argument('--save-dir', type=str, default='checkpoints_stage1', help='Checkpoint output directory')
+    parser.add_argument('--load', type=str, default='', help='Resume from checkpoint')
+
+    parser.add_argument('--epochs', '-e', type=int, default=100)
+    parser.add_argument('--batch-size', '-b', dest='batch_size', type=int, default=4)
+    parser.add_argument('--learning-rate', '-l', dest='lr', type=float, default=2e-4)
+    parser.add_argument('--weight-decay', type=float, default=1e-4)
+    parser.add_argument('--num-workers', type=int, default=4)
+    parser.add_argument('--grad-clip', type=float, default=1.0)
+    parser.add_argument('--amp', action='store_true', default=False)
+    parser.add_argument('--bilinear', action='store_true', default=False)
+
+    parser.add_argument('--in-channels', type=int, default=3)
+    parser.add_argument('--out-channels', type=int, default=3)
+    parser.add_argument('--base-channels', type=int, default=64)
+    parser.add_argument('--time-dim', type=int, default=128)
+    parser.add_argument('--residual-scale', type=float, default=1.0)
+    parser.add_argument('--direct-prediction', action='store_true', default=False,
+                        help='Disable residual prediction and predict targets directly')
+
+    parser.add_argument('--image-size', type=int, default=256, help='Resize images before cropping')
+    parser.add_argument('--crop-size', type=int, default=256, help='Training/validation crop size')
+    parser.add_argument('--save-every', type=int, default=5)
+
+    parser.add_argument('--reconstruction-weight', type=float, default=1.0)
+    parser.add_argument('--high-frequency-weight', type=float, default=0.5)
+    parser.add_argument('--patch-nce-weight', type=float, default=0.1)
+    parser.add_argument('--bro-weight', type=float, default=0.05)
+    parser.add_argument('--irc-weight', type=float, default=0.05)
+    parser.add_argument('--charbonnier-eps', type=float, default=1e-3)
+    parser.add_argument('--patch-size', type=int, default=7)
+    parser.add_argument('--patch-stride', type=int, default=4)
+    parser.add_argument('--patch-temperature', type=float, default=0.07)
+    parser.add_argument('--max-patches', type=int, default=128)
+    parser.add_argument('--contrastive-temperature', type=float, default=0.1)
+    parser.add_argument('--projector-dim', type=int, default=128)
+
+    return parser
+
+
+def move_batch_to_device(batch, device):
+    moved = {}
+    for key, value in batch.items():
+        moved[key] = value.to(device, non_blocking=True) if torch.is_tensor(value) else value
+    return moved
+
+
+def summarize_metrics(history):
+    if not history:
+        return {}
+    keys = history[0].keys()
+    return {key: sum(item[key] for item in history) / len(history) for key in keys}
+
+
+def evaluate(model, criterion, loader, device, amp):
+    model.eval()
+    criterion.eval()
+    history = []
+    with torch.no_grad():
+        for batch in loader:
+            batch = move_batch_to_device(batch, device)
+            images = batch['image'].to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
+            batch['image'] = images
+            batch['target'] = batch['target'].to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
+
+            with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
+                outputs = model(images, batch['time_step'])
+                _, metrics = criterion(outputs, batch)
+
+            history.append({key: float(value.item()) for key, value in metrics.items()})
+    return summarize_metrics(history)
+
+
+def train_model(model, criterion, optimizer, train_loader, val_loader, device, args):
+    scaler = torch.amp.GradScaler('cuda', enabled=args.amp and device.type == 'cuda')
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    (save_dir / 'train_args.json').write_text(json.dumps(vars(args), indent=2))
+
+    best_val = float('inf')
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        criterion.train()
+        epoch_history = []
+        with tqdm(total=len(train_loader.dataset), desc=f'Epoch {epoch}/{args.epochs}', unit='img') as pbar:
+            for batch in train_loader:
+                batch = move_batch_to_device(batch, device)
+                images = batch['image'].to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
+                targets = batch['target'].to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
+                batch['image'] = images
+                batch['target'] = targets
+
+                with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=args.amp):
+                    outputs = model(images, batch['time_step'])
+                    loss, metrics = criterion(outputs, batch)
+
+                optimizer.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    list(model.parameters()) + list(criterion.parameters()), args.grad_clip
+                )
+                scaler.step(optimizer)
+                scaler.update()
+
+                epoch_history.append({key: float(value.item()) for key, value in metrics.items()})
+                pbar.update(images.shape[0])
+                pbar.set_postfix(loss=float(metrics['loss_total'].item()))
+
+        train_metrics = summarize_metrics(epoch_history)
+        logging.info('[train] %s', ' '.join(f'{k}={v:.4f}' for k, v in train_metrics.items()))
+
+        val_metrics = {}
+        if val_loader is not None:
+            val_metrics = evaluate(model, criterion, val_loader, device, args.amp)
+            logging.info('[val] %s', ' '.join(f'{k}={v:.4f}' for k, v in val_metrics.items()))
+
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'criterion_state_dict': criterion.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'args': vars(args),
+            'train_metrics': train_metrics,
+            'val_metrics': val_metrics,
+        }
+        if epoch % args.save_every == 0 or epoch == args.epochs:
+            torch.save(checkpoint, save_dir / f'checkpoint_epoch_{epoch:03d}.pth')
+        if val_metrics and val_metrics.get('loss_total', float('inf')) < best_val:
+            best_val = val_metrics['loss_total']
+            torch.save(checkpoint, save_dir / 'best_stage1.pth')
+
+
+def main():
+    args = create_argparser().parse_args()
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logging.info('Using device %s', device)
+
+    model = SBEQUNet(
+        n_channels=args.in_channels,
+        out_channels=args.out_channels,
+        bilinear=args.bilinear,
+        time_dim=args.time_dim,
+        residual_scale=args.residual_scale,
+        predict_residual=not args.direct_prediction,
+        base_channels=args.base_channels,
+    )
+    model = model.to(memory_format=torch.channels_last)
+    model.to(device=device)
+
+    if args.load:
+        checkpoint = torch.load(args.load, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        logging.info('Loaded checkpoint from %s', args.load)
+
+    criterion = Stage1RestorationLoss(
+        reconstruction_weight=args.reconstruction_weight,
+        high_frequency_weight=args.high_frequency_weight,
+        patch_nce_weight=args.patch_nce_weight,
+        bro_weight=args.bro_weight,
+        irc_weight=args.irc_weight,
+        charbonnier_eps=args.charbonnier_eps,
+        patch_size=args.patch_size,
+        patch_stride=args.patch_stride,
+        patch_temperature=args.patch_temperature,
+        max_patches=args.max_patches,
+        contrastive_temperature=args.contrastive_temperature,
+        projector_dim=args.projector_dim,
+    ).to(device)
+
+    optimizer = optim.AdamW(
+        list(model.parameters()) + list(criterion.parameters()),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+
+    train_set = PairedRestorationDataset(
+        input_dir=args.train_input_dir,
+        target_dir=args.train_target_dir,
+        image_size=args.image_size,
+        crop_size=args.crop_size,
+        manifest=args.train_manifest or None,
+        in_channels=args.in_channels,
+        is_train=True,
+    )
+    loader_args = dict(batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True)
+    train_loader = DataLoader(train_set, shuffle=True, **loader_args)
+
+    val_loader = None
+    if args.val_input_dir and args.val_target_dir:
+        val_set = PairedRestorationDataset(
+            input_dir=args.val_input_dir,
+            target_dir=args.val_target_dir,
+            image_size=args.image_size,
+            crop_size=args.crop_size,
+            manifest=args.val_manifest or None,
+            in_channels=args.in_channels,
+            is_train=False,
+        )
+        val_loader = DataLoader(val_set, shuffle=False, **loader_args)
+
+    train_model(model, criterion, optimizer, train_loader, val_loader, device, args)
+
+
+if __name__ == '__main__':
+    main()
