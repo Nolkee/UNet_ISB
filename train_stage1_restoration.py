@@ -96,9 +96,8 @@ def evaluate(model, criterion, loader, device, amp):
     with torch.no_grad():
         for batch in loader:
             batch = move_batch_to_device(batch, device)
-            images = batch['image'].to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
-            batch['image'] = images
-            batch['target'] = batch['target'].to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
+            batch['image'] = batch['image'].to(dtype=torch.float32, memory_format=torch.channels_last)
+            batch['target'] = batch['target'].to(dtype=torch.float32, memory_format=torch.channels_last)
 
             with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                 outputs = model(images, batch['time_step'])
@@ -131,13 +130,11 @@ def train_model(
         with tqdm(total=len(train_loader.dataset), desc=f'Epoch {epoch}/{args.epochs}', unit='img') as pbar:
             for batch in train_loader:
                 batch = move_batch_to_device(batch, device)
-                images = batch['image'].to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
-                targets = batch['target'].to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
-                batch['image'] = images
-                batch['target'] = targets
+                batch['image'] = batch['image'].to(dtype=torch.float32, memory_format=torch.channels_last)
+                batch['target'] = batch['target'].to(dtype=torch.float32, memory_format=torch.channels_last)
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=args.amp):
-                    outputs = model(images, batch['time_step'])
+                    outputs = model(batch['image'], batch['time_step'])
                     loss, metrics = criterion(outputs, batch)
 
                 optimizer.zero_grad(set_to_none=True)
@@ -150,7 +147,7 @@ def train_model(
                 scaler.update()
 
                 epoch_history.append({key: float(value.item()) for key, value in metrics.items()})
-                pbar.update(images.shape[0])
+                pbar.update(batch['image'].shape[0])
                 pbar.set_postfix(loss=float(metrics['loss_total'].item()))
 
         train_metrics = summarize_metrics(epoch_history)
