@@ -6,10 +6,10 @@ from pathlib import Path
 
 TRAIN_INPUT = Path('/home/cavin/CJX/fastMRIdata/MRI_dataset/train_dataset/train_slices/noisy_esc')
 TRAIN_TARGET = Path('/home/cavin/CJX/fastMRIdata/MRI_dataset/train_dataset/train_slices/rss_norm')
-TRAIN_MANIFEST = Path('/home/cavin/CJX/fastMRIdata/MRI_dataset/train_dataset/mainfest_train.csv')
+TRAIN_MANIFEST = Path('/home/cavin/CJX/fastMRIdata/MRI_dataset/train_dataset/train_slices/manifest_train.csv')
 VAL_INPUT = Path('/home/cavin/CJX/fastMRIdata/MRI_dataset/test_dataset/test_slices/noisy_esc')
 VAL_TARGET = Path('/home/cavin/CJX/fastMRIdata/MRI_dataset/test_dataset/test_slices/rss_norm')
-VAL_MANIFEST = Path('/home/cavin/CJX/fastMRIdata/MRI_dataset/test_dataset/mainfest_val.csv')
+VAL_MANIFEST = Path('/home/cavin/CJX/fastMRIdata/MRI_dataset/test_dataset/test_slices/manifest_test.csv')
 IMAGE_SUFFIXES = {'.png', '.jpg', '.jpeg', '.npy', '.pt', '.pth'}
 
 
