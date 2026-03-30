@@ -78,26 +78,67 @@ class PairedRestorationDataset(Dataset):
         delimiter = '\t' if manifest.suffix.lower() == '.tsv' else ','
         manifest_root = manifest.parent
         samples = []
-        with manifest.open('r', newline='') as handle:
+        with manifest.open('r', newline='', encoding='utf-8-sig') as handle:
             reader = csv.DictReader(handle, delimiter=delimiter)
+            fields = reader.fieldnames or []
+            input_key, target_key = self._resolve_manifest_path_keys(fields)
             for row in reader:
-                input_path = self._resolve_path(self.input_dir, row['input_path'], manifest_root)
-                target_path = self._resolve_path(self.target_dir, row['target_path'], manifest_root)
+                raw_input = (row.get(input_key) or '').strip()
+                raw_target = (row.get(target_key) or '').strip()
+                if not raw_input or not raw_target:
+                    continue
+
+                input_path = self._resolve_path(self.input_dir, raw_input, manifest_root)
+                target_path = self._resolve_path(self.target_dir, raw_target, manifest_root)
+                if not input_path.exists() or not target_path.exists():
+                    continue
+
                 label = self._resolve_label(
                     row.get('degradation_label'),
                     row.get('degradation_type'),
                     row.get('degradation_level'),
                 )
+                sample_id = self._resolve_sample_id(row, input_path)
                 samples.append(
                     RestorationSample(
                         input_path=input_path,
                         target_path=target_path,
-                        timestep=float(row.get('timestep', self.default_timestep)),
+                        timestep=float((row.get('timestep') or self.default_timestep)),
                         label=label,
-                        sample_id=input_path.stem,
+                        sample_id=sample_id,
                     )
                 )
         return samples
+
+    def _resolve_manifest_path_keys(self, fields: list[str]) -> tuple[str, str]:
+        field_map = {field.strip().lower(): field for field in fields if field}
+        input_candidates = [
+            'input_path',
+            f'{self.input_dir.name.lower()}_path',
+            self.input_dir.name.lower(),
+        ]
+        target_candidates = [
+            'target_path',
+            f'{self.target_dir.name.lower()}_path',
+            self.target_dir.name.lower(),
+        ]
+
+        input_key = next((field_map[candidate] for candidate in input_candidates if candidate in field_map), None)
+        target_key = next((field_map[candidate] for candidate in target_candidates if candidate in field_map), None)
+        if input_key is None or target_key is None:
+            raise KeyError(
+                'Manifest missing path columns. '
+                f'Expected one of {input_candidates} for input and {target_candidates} for target, '
+                f'but got {fields}'
+            )
+        return input_key, target_key
+
+    def _resolve_sample_id(self, row: dict[str, str], input_path: Path) -> str:
+        volume = (row.get('volume') or '').strip()
+        slice_id = (row.get('slice_id') or '').strip()
+        if volume and slice_id:
+            return f'{volume}_s{slice_id}'
+        return input_path.stem
 
     def _resolve_path(self, default_root: Path, raw_path: str, manifest_root: Path) -> Path:
         path = Path(raw_path)
