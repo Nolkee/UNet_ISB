@@ -100,7 +100,7 @@ def evaluate(model, criterion, loader, device, amp):
             batch['target'] = batch['target'].to(dtype=torch.float32, memory_format=torch.channels_last)
 
             with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
-                outputs = model(images, batch['time_step'])
+                outputs = model(batch['image'], batch['time_step'])
                 _, metrics = criterion(outputs, batch)
 
             history.append({key: float(value.item()) for key, value in metrics.items()})
