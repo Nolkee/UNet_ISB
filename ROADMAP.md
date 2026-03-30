@@ -1,6 +1,6 @@
 # SB-EQ U-Net 三段训练路线图
 
-## 📍 当前状态：Stage-1（已完成代码）
+## 当前状态：Stage-1（已完成代码）
 
 ### Stage-1：初步训练生成器
 **目标**：
@@ -10,72 +10,91 @@
 
 **特点**：
 - ✅ 不使用判别器
-- ✅ 不使用完整barycenter regularization
+- ✅ 不使用完整 barycenter regularization
 - ✅ 配对训练：noisy_esc → rss_norm
+- ✅ 验证阶段自动保存少量固定样本的 `input / output / GT` 三联图
 
 **数据集**：
-- 训练：2420张 noisy_esc → 2420张 rss_norm（配对）
-- 验证：1000张 noisy_esc → 1000张 rss_norm（配对）
+- 训练：2420 张 noisy_esc → 2420 张 rss_norm（配对）
+- 验证：1000 张 noisy_esc → 1000 张 rss_norm（配对）
 
 **启动命令**：
 ```bash
-bash configs/stage1_config.sh
+bash stages/stage1/train.sh
 ```
 
 **预期输出**：
 - `checkpoints_stage1/best_stage1.pth`
+- `checkpoints_stage1/val_triplets/epoch_XXX/*.png`
 
 ---
 
-## 🔜 Stage-2：加入无配对SB + PatchGAN（待实现）
+## Stage-2：加入无配对 SB + PatchGAN（待实现）
 
 **需要新增**：
-1. PatchGAN判别器
+1. PatchGAN 判别器
 2. 对抗损失（Adversarial Loss）
-3. 无配对SB损失
+3. 无配对 SB 损失
 4. 非配对数据加载器
 
 **数据集**：
-- Set A: 2420张 noisy_esc（非配对）
-- Set B: 2420张 rss_norm（非配对）
-- 使用 manifest_train.csv 避免样本重叠
+- Set A: 2420 张 noisy_esc（非配对）
+- Set B: 2420 张 rss_norm（非配对）
+- 使用 `manifest_train.csv` 避免样本重叠
 
-**加载Stage-1权重**：
+**占位脚本**：
+```bash
+bash stages/stage2/train.sh
+```
+
+**加载 Stage-1 权重**：
 ```bash
 --load checkpoints_stage1/best_stage1.pth
 ```
 
 ---
 
-## 🎯 Stage-3：完整Barycenter Regularization（待实现）
+## Stage-3：完整 Barycenter Regularization（待实现）
 
 **需要新增**：
-1. 完整barycenter regularization
-2. 强化b的退化无关属性
-3. 强化r的退化判别性
+1. 完整 barycenter regularization
+2. 强化 b 的退化无关属性
+3. 强化 r 的退化判别性
 
-**加载Stage-2权重**：
+**占位脚本**：
+```bash
+bash stages/stage3/train.sh
+```
+
+**加载 Stage-2 权重**：
 ```bash
 --load checkpoints_stage2/best_stage2.pth
 ```
 
 ---
 
-## ✅ 立即行动清单
+## 立即行动清单
 
-### 1. 启动Stage-1训练
+### 1. 验证 Stage-1 数据集
 ```bash
 cd /Users/lucas/Projects/UNet_ISB/UNet_ISB_repo
-bash configs/stage1_config.sh
+python stages/stage1/verify_dataset.py
 ```
 
-### 2. 监控训练
+### 2. 启动 Stage-1 训练
+```bash
+cd /Users/lucas/Projects/UNet_ISB/UNet_ISB_repo
+bash stages/stage1/train.sh
+```
+
+### 3. 监控训练
 ```bash
 watch -n 1 nvidia-smi
-tail -f checkpoints_stage1/train.log
+bash stages/stage1/train.sh | tee checkpoints_stage1/train_stdout.log
 ```
 
-### 3. Stage-1完成后
+### 4. Stage-1 完成后
 - 检查 `best_stage1.pth` 是否生成
-- 在测试集上评估 PSNR/SSIM/LPIPS
-- 开始实现Stage-2的判别器
+- 检查 `val_triplets/` 中的输入 / 输出 / GT 三联图是否按 epoch 保存
+- 在测试集上评估 PSNR / SSIM / LPIPS
+- 开始实现 Stage-2 的判别器

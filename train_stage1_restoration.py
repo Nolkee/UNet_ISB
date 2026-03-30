@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 
 import torch
+from PIL import Image
 from torch import optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -48,6 +49,10 @@ def create_argparser():
     parser.add_argument('--default-timestep', type=float, default=1.0,
                         help='Fallback timestep used when no manifest is provided')
     parser.add_argument('--save-every', type=int, default=5)
+    parser.add_argument('--val-save-count', type=int, default=4,
+                        help='Number of validation triplets to save per epoch (0 disables saving)')
+    parser.add_argument('--val-save-subdir', type=str, default='val_triplets',
+                        help='Subdirectory under save-dir for validation triplets')
 
     parser.add_argument('--reconstruction-weight', type=float, default=1.0)
     parser.add_argument('--high-frequency-weight', type=float, default=0.5)
@@ -79,6 +84,56 @@ def summarize_metrics(history):
     return {key: sum(item[key] for item in history) / len(history) for key in keys}
 
 
+def select_validation_indices(dataset_size: int, count: int) -> set[int]:
+    if dataset_size <= 0 or count <= 0:
+        return set()
+    if count >= dataset_size:
+        return set(range(dataset_size))
+    if count == 1:
+        return {0}
+
+    step = (dataset_size - 1) / (count - 1)
+    indices = {min(dataset_size - 1, round(i * step)) for i in range(count)}
+    next_index = 0
+    while len(indices) < count:
+        indices.add(next_index)
+        next_index += 1
+    return indices
+
+
+def sanitize_sample_id(sample_id: str) -> str:
+    sanitized = ''.join(char if char.isalnum() or char in {'-', '_', '.'} else '_' for char in sample_id.strip())
+    return sanitized or 'sample'
+
+
+def tensor_to_pil_image(tensor: torch.Tensor) -> Image.Image:
+    image = tensor.detach().float().cpu().clamp(0, 1)
+    if image.ndim != 3:
+        raise ValueError(f'Expected CHW tensor for image saving, got shape {tuple(image.shape)}')
+    if image.shape[0] == 1:
+        return Image.fromarray(image.squeeze(0).mul(255).round().byte().numpy())
+    if image.shape[0] == 3:
+        return Image.fromarray(image.permute(1, 2, 0).mul(255).round().byte().numpy())
+    raise ValueError(f'Expected 1 or 3 channels for image saving, got {image.shape[0]}')
+
+
+def save_validation_triplet(
+    output_dir: Path,
+    epoch: int,
+    sample_index: int,
+    sample_id: str,
+    image: torch.Tensor,
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> None:
+    epoch_dir = output_dir / f'epoch_{epoch:03d}'
+    epoch_dir.mkdir(parents=True, exist_ok=True)
+    prefix = f'{sample_index:04d}_{sanitize_sample_id(sample_id)}'
+    tensor_to_pil_image(image).save(epoch_dir / f'{prefix}_input.png')
+    tensor_to_pil_image(prediction).save(epoch_dir / f'{prefix}_pred.png')
+    tensor_to_pil_image(target).save(epoch_dir / f'{prefix}_target.png')
+
+
 def resolve_device(device_arg: str) -> torch.device:
     if device_arg != 'auto':
         return torch.device(device_arg)
@@ -89,10 +144,13 @@ def resolve_device(device_arg: str) -> torch.device:
     return torch.device('cpu')
 
 
-def evaluate(model, criterion, loader, device, amp):
+def evaluate(model, criterion, loader, device, amp, epoch: int, val_save_count: int, val_save_dir: Path | None):
     model.eval()
     criterion.eval()
     history = []
+    selected_indices = select_validation_indices(len(loader.dataset), val_save_count) if val_save_dir else set()
+    sample_index = 0
+
     with torch.no_grad():
         for batch in loader:
             batch = move_batch_to_device(batch, device)
@@ -102,6 +160,23 @@ def evaluate(model, criterion, loader, device, amp):
             with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                 outputs = model(batch['image'], batch['time_step'])
                 _, metrics = criterion(outputs, batch)
+
+            predictions = outputs['prediction']
+            batch_size = batch['image'].shape[0]
+            sample_ids = batch['id']
+            for batch_offset in range(batch_size):
+                current_index = sample_index + batch_offset
+                if current_index in selected_indices and val_save_dir is not None:
+                    save_validation_triplet(
+                        output_dir=val_save_dir,
+                        epoch=epoch,
+                        sample_index=current_index,
+                        sample_id=sample_ids[batch_offset],
+                        image=batch['image'][batch_offset],
+                        prediction=predictions[batch_offset],
+                        target=batch['target'][batch_offset],
+                    )
+            sample_index += batch_size
 
             history.append({key: float(value.item()) for key, value in metrics.items()})
     return summarize_metrics(history)
@@ -122,6 +197,7 @@ def train_model(
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     (save_dir / 'train_args.json').write_text(json.dumps(vars(args), indent=2))
+    val_save_dir = save_dir / args.val_save_subdir if args.val_save_count > 0 else None
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
@@ -155,7 +231,16 @@ def train_model(
 
         val_metrics = {}
         if val_loader is not None:
-            val_metrics = evaluate(model, criterion, val_loader, device, args.amp)
+            val_metrics = evaluate(
+                model,
+                criterion,
+                val_loader,
+                device,
+                args.amp,
+                epoch=epoch,
+                val_save_count=args.val_save_count,
+                val_save_dir=val_save_dir,
+            )
             logging.info('[val] %s', ' '.join(f'{k}={v:.4f}' for k, v in val_metrics.items()))
 
         checkpoint = {

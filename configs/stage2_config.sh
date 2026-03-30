@@ -1,10 +1,7 @@
 #!/bin/bash
-# Stage-2: 加入无配对SB + PatchGAN判别器
-# TODO: 需要实现判别器和对抗损失
+# Compatibility wrapper for the canonical Stage-2 launcher.
 
-echo "Stage-2 training script - To be implemented"
-echo "Requirements:"
-echo "  1. PatchGAN discriminator"
-echo "  2. Adversarial loss"
-echo "  3. Unpaired SB loss"
-echo "  4. Load Stage-1 checkpoint"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+bash "$REPO_ROOT/stages/stage2/train.sh"
