@@ -3,6 +3,7 @@
 
 import sys
 
+
 def check_environment():
     print("=== Environment Check ===\n")
 
@@ -25,19 +26,41 @@ def check_environment():
         print("PyTorch: NOT INSTALLED")
         return False
 
-    # Other dependencies
-    deps = ['numpy', 'PIL', 'tqdm']
-    for dep in deps:
+    basic_dependencies = [
+        ('numpy', 'numpy'),
+        ('Pillow', 'PIL'),
+        ('tqdm', 'tqdm'),
+    ]
+    for display_name, module_name in basic_dependencies:
         try:
-            mod = __import__(dep)
+            mod = __import__(module_name)
             ver = getattr(mod, '__version__', 'unknown')
-            print(f"{dep}: {ver}")
+            print(f"{display_name}: {ver}")
         except ImportError:
-            print(f"{dep}: NOT INSTALLED")
+            print(f"{display_name}: NOT INSTALLED")
             return False
+
+    try:
+        from torchmetrics.functional.image import (
+            peak_signal_noise_ratio,
+            structural_similarity_index_measure,
+        )
+        print(f"torchmetrics: PSNR={peak_signal_noise_ratio.__module__} SSIM={structural_similarity_index_measure.__module__}")
+    except ImportError:
+        print("torchmetrics: NOT INSTALLED")
+        return False
+
+    try:
+        import lpips
+        ver = getattr(lpips, '__version__', 'unknown')
+        print(f"lpips: {ver}")
+    except ImportError:
+        print("lpips: NOT INSTALLED")
+        return False
 
     print("\n✅ All dependencies satisfied")
     return True
+
 
 if __name__ == '__main__':
     success = check_environment()

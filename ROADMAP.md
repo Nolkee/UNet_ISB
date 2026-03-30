@@ -13,6 +13,7 @@
 - ✅ 不使用完整 barycenter regularization
 - ✅ 配对训练：noisy_esc → rss_norm
 - ✅ 验证阶段自动保存少量固定样本的 `input / output / GT` 三联图
+- ✅ 训练结束后自动对验证/测试集输出 PSNR / SSIM / LPIPS
 
 **数据集**：
 - 训练：2420 张 noisy_esc → 2420 张 rss_norm（配对）
@@ -25,6 +26,7 @@ bash stages/stage1/train.sh
 
 **预期输出**：
 - `checkpoints_stage1/best_stage1.pth`
+- `checkpoints_stage1/final_eval_metrics.json`
 - `checkpoints_stage1/val_triplets/epoch_XXX/*.png`
 
 ---
@@ -95,6 +97,6 @@ bash stages/stage1/train.sh | tee checkpoints_stage1/train_stdout.log
 
 ### 4. Stage-1 完成后
 - 检查 `best_stage1.pth` 是否生成
+- 检查 `final_eval_metrics.json` 是否生成，并确认其中的 `checkpoint / psnr / ssim / lpips` 都是有效值
 - 检查 `val_triplets/` 中的输入 / 输出 / GT 三联图是否按 epoch 保存
-- 在测试集上评估 PSNR / SSIM / LPIPS
 - 开始实现 Stage-2 的判别器

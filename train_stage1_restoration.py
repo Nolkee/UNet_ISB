@@ -12,6 +12,7 @@ from tqdm import tqdm
 from unet import SBEQUNet
 from utils.restoration_data_loading import PairedRestorationDataset
 from utils.restoration_losses import Stage1RestorationLoss
+from utils.restoration_metrics import RestorationMetricTracker, ensure_restoration_metric_dependencies
 
 
 def create_argparser():
@@ -180,6 +181,67 @@ def evaluate(model, criterion, loader, device, amp, epoch: int, val_save_count: 
 
             history.append({key: float(value.item()) for key, value in metrics.items()})
     return summarize_metrics(history)
+
+
+def evaluate_restoration_metrics(model, loader, device, amp):
+    model.eval()
+    tracker = RestorationMetricTracker(device)
+
+    with torch.no_grad():
+        with tqdm(total=len(loader.dataset), desc='Final evaluation', unit='img') as pbar:
+            for batch in loader:
+                batch = move_batch_to_device(batch, device)
+                batch['image'] = batch['image'].to(dtype=torch.float32, memory_format=torch.channels_last)
+                batch['target'] = batch['target'].to(dtype=torch.float32, memory_format=torch.channels_last)
+
+                with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
+                    outputs = model(batch['image'], batch['time_step'])
+
+                tracker.update(outputs['prediction'], batch['target'])
+                pbar.update(batch['image'].shape[0])
+
+    return tracker.compute()
+
+
+def load_checkpoint_for_final_evaluation(model, checkpoint_path: Path, device: torch.device) -> None:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+
+
+def run_final_restoration_evaluation(model, loader, device, amp, save_dir: Path) -> None:
+    save_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_label = 'in-memory model state'
+    best_checkpoint = save_dir / 'best_stage1.pth'
+    checkpoint_path = None
+    if best_checkpoint.exists():
+        checkpoint_path = best_checkpoint
+    else:
+        checkpoint_candidates = sorted(save_dir.glob('checkpoint_epoch_*.pth'))
+        if checkpoint_candidates:
+            checkpoint_path = checkpoint_candidates[-1]
+
+    if checkpoint_path is not None:
+        load_checkpoint_for_final_evaluation(model, checkpoint_path, device)
+        checkpoint_label = checkpoint_path.name
+    else:
+        logging.warning(
+            'No checkpoint file found in %s; final evaluation will use the in-memory model state.',
+            save_dir,
+        )
+
+    metrics = evaluate_restoration_metrics(model, loader, device, amp)
+    results = {'checkpoint': checkpoint_label, **metrics}
+    output_path = save_dir / 'final_eval_metrics.json'
+    output_path.write_text(json.dumps(results, indent=2))
+    logging.info(
+        '[final-eval] checkpoint=%s sample_count=%d psnr=%.4f ssim=%.4f lpips=%.4f',
+        checkpoint_label,
+        metrics['sample_count'],
+        metrics['psnr'],
+        metrics['ssim'],
+        metrics['lpips'],
+    )
+    logging.info('Saved final restoration metrics to %s', output_path)
 
 
 def train_model(
@@ -357,7 +419,15 @@ def main():
     if start_epoch > args.epochs:
         logging.info('Checkpoint epoch %d already meets or exceeds requested epochs=%d; nothing to train.',
                      start_epoch - 1, args.epochs)
+        if val_loader is None:
+            logging.warning('Skipping final PSNR/SSIM/LPIPS evaluation because no validation dataset is configured.')
+            return
+        ensure_restoration_metric_dependencies()
+        run_final_restoration_evaluation(model, val_loader, device, args.amp, Path(args.save_dir))
         return
+
+    if val_loader is not None:
+        ensure_restoration_metric_dependencies()
 
     if start_epoch > 1:
         logging.info('Resuming stage-1 training from epoch %d', start_epoch)
@@ -373,6 +443,12 @@ def main():
         start_epoch=start_epoch,
         best_val=best_val,
     )
+
+    if val_loader is None:
+        logging.warning('Skipping final PSNR/SSIM/LPIPS evaluation because no validation dataset is configured.')
+        return
+
+    run_final_restoration_evaluation(model, val_loader, device, args.amp, Path(args.save_dir))
 
 
 if __name__ == '__main__':

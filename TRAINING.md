@@ -7,6 +7,8 @@
 python check_env.py
 ```
 
+这一步会同时检查 `torchmetrics` 和 `lpips`，避免训练结束后才因为缺少 PSNR / SSIM / LPIPS 依赖而失败。
+
 ### 2. 验证数据集
 ```bash
 python stages/stage1/verify_dataset.py
@@ -52,6 +54,9 @@ python train_stage1_restoration.py \
 - `checkpoints_stage1/best_stage1.pth`: 验证集最佳模型
 - `checkpoints_stage1/train_args.json`: 训练参数记录
 - `checkpoints_stage1/val_triplets/epoch_XXX/`: 每轮固定少量验证三联图
+- `checkpoints_stage1/final_eval_metrics.json`: 训练结束后基于最终评估写出的 PSNR / SSIM / LPIPS 结果
+
+最终评估默认会在训练结束后自动运行一次；若存在 `best_stage1.pth`，则优先评估该 checkpoint。
 
 ## 验证三联图说明
 
