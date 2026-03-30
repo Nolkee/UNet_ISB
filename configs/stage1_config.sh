@@ -3,10 +3,10 @@
 
 TRAIN_INPUT="/home/cavin/CJX/fastMRIdata/MRI_dataset/train_dataset/train_slices/noisy_esc"
 TRAIN_TARGET="/home/cavin/CJX/fastMRIdata/MRI_dataset/train_dataset/train_slices/rss_norm"
-TRAIN_MANIFEST="/home/cavin/CJX/fastMRIdata/MRI_dataset/train_dataset/manifest_train.csv"
+TRAIN_MANIFEST="/home/cavin/CJX/fastMRIdata/MRI_dataset/train_dataset/mainfest_train.csv"
 VAL_INPUT="/home/cavin/CJX/fastMRIdata/MRI_dataset/test_dataset/test_slices/noisy_esc"
 VAL_TARGET="/home/cavin/CJX/fastMRIdata/MRI_dataset/test_dataset/test_slices/rss_norm"
-VAL_MANIFEST="/home/cavin/CJX/fastMRIdata/MRI_dataset/test_dataset/manifest_val.csv"
+VAL_MANIFEST="/home/cavin/CJX/fastMRIdata/MRI_dataset/test_dataset/mainfest_val.csv"
 
 CMD=(
   python train_stage1_restoration.py
