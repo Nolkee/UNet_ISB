@@ -15,9 +15,20 @@ def load_image(filename: str | Path) -> Image.Image:
     path = Path(filename)
     ext = path.suffix.lower()
     if ext == '.npy':
-        return Image.fromarray(np.load(path))
+        array = np.load(path)
+        return Image.fromarray(np.asarray(array, dtype=np.float32))
     if ext in {'.pt', '.pth'}:
-        return Image.fromarray(torch.load(path).numpy())
+        tensor = torch.load(path, map_location='cpu')
+        if torch.is_tensor(tensor):
+            tensor = tensor.detach().cpu().numpy()
+        array = np.asarray(tensor)
+        if array.ndim == 3 and array.shape[0] in {1, 3}:
+            array = np.moveaxis(array, 0, -1)
+        if array.ndim == 3 and array.shape[-1] == 1:
+            array = array[..., 0]
+        if np.issubdtype(array.dtype, np.floating):
+            array = array.astype(np.float32, copy=False)
+        return Image.fromarray(array)
     return Image.open(path)
 
 
@@ -178,6 +189,8 @@ class PairedRestorationDataset(Dataset):
 
     def _load(self, path: Path) -> Image.Image:
         image = load_image(path)
+        if path.suffix.lower() in {'.npy', '.pt', '.pth'}:
+            return image
         return image.convert('L') if self.in_channels == 1 else image.convert('RGB')
 
     def _resize(self, image: Image.Image, target: Image.Image) -> tuple[Image.Image, Image.Image]:
@@ -224,6 +237,6 @@ class PairedRestorationDataset(Dataset):
         if array.ndim == 2:
             array = array[:, :, None]
         array = array.transpose((2, 0, 1))
-        if (array > 1).any():
+        if image.mode != 'F' and (array > 1).any():
             array = array / 255.0
         return torch.as_tensor(array.copy()).float().contiguous()

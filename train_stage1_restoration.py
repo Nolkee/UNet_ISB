@@ -85,6 +85,37 @@ def summarize_metrics(history):
     return {key: sum(item[key] for item in history) / len(history) for key in keys}
 
 
+def raise_if_non_finite_loss(loss, metrics, batch, outputs, epoch: int, step: int) -> None:
+    invalid_keys = [key for key, value in metrics.items() if not torch.isfinite(value).all()]
+    if torch.isfinite(loss).all() and not invalid_keys:
+        return
+
+    sample_ids = batch.get('id', [])
+    if isinstance(sample_ids, tuple):
+        sample_ids = list(sample_ids)
+    sample_preview = sample_ids[:4] if isinstance(sample_ids, list) else sample_ids
+    prediction = outputs['prediction'].detach().float()
+    image = batch['image'].detach().float()
+    target = batch['target'].detach().float()
+    metric_summary = ' '.join(f'{key}={float(value.detach().item())}' for key, value in metrics.items())
+    logging.error(
+        'Non-finite Stage-1 loss at epoch=%d step=%d ids=%s invalid=%s image_range=[%.6f, %.6f] '
+        'target_range=[%.6f, %.6f] pred_range=[%.6f, %.6f] %s',
+        epoch,
+        step,
+        sample_preview,
+        ['loss_total', *invalid_keys] if not torch.isfinite(loss).all() else invalid_keys,
+        float(image.amin().item()),
+        float(image.amax().item()),
+        float(target.amin().item()),
+        float(target.amax().item()),
+        float(prediction.amin().item()),
+        float(prediction.amax().item()),
+        metric_summary,
+    )
+    raise FloatingPointError('Non-finite Stage-1 loss encountered. See the logged loss breakdown for the offending batch.')
+
+
 def select_validation_indices(dataset_size: int, count: int) -> set[int]:
     if dataset_size <= 0 or count <= 0:
         return set()
@@ -153,7 +184,7 @@ def evaluate(model, criterion, loader, device, amp, epoch: int, val_save_count: 
     sample_index = 0
 
     with torch.no_grad():
-        for batch in loader:
+        for step, batch in enumerate(loader, start=1):
             batch = move_batch_to_device(batch, device)
             batch['image'] = batch['image'].to(dtype=torch.float32, memory_format=torch.channels_last)
             batch['target'] = batch['target'].to(dtype=torch.float32, memory_format=torch.channels_last)
@@ -179,6 +210,7 @@ def evaluate(model, criterion, loader, device, amp, epoch: int, val_save_count: 
                     )
             sample_index += batch_size
 
+            raise_if_non_finite_loss(metrics['loss_total'], metrics, batch, outputs, epoch=epoch, step=step)
             history.append({key: float(value.item()) for key, value in metrics.items()})
     return summarize_metrics(history)
 
@@ -266,7 +298,7 @@ def train_model(
         criterion.train()
         epoch_history = []
         with tqdm(total=len(train_loader.dataset), desc=f'Epoch {epoch}/{args.epochs}', unit='img') as pbar:
-            for batch in train_loader:
+            for step, batch in enumerate(train_loader, start=1):
                 batch = move_batch_to_device(batch, device)
                 batch['image'] = batch['image'].to(dtype=torch.float32, memory_format=torch.channels_last)
                 batch['target'] = batch['target'].to(dtype=torch.float32, memory_format=torch.channels_last)
@@ -274,6 +306,8 @@ def train_model(
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=args.amp):
                     outputs = model(batch['image'], batch['time_step'])
                     loss, metrics = criterion(outputs, batch)
+
+                raise_if_non_finite_loss(loss, metrics, batch, outputs, epoch=epoch, step=step)
 
                 optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
