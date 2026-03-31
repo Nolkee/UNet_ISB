@@ -132,12 +132,12 @@ class Stage1RestorationLoss(nn.Module):
         self.irc = ResidualContrastiveLoss(residual_feature_dim, contrastive_temperature, projector_dim)
 
     def forward(self, outputs: dict[str, torch.Tensor | list[torch.Tensor]], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        prediction = outputs['prediction']
-        target = batch['target']
-        source = batch['image']
-        mask_reg = outputs['mask_reg']
-        barycenter = outputs['barycenter']
-        residual = outputs['residual']
+        prediction = outputs['prediction'].float()
+        target = batch['target'].float()
+        source = batch['image'].float()
+        mask_reg = outputs['mask_reg'].float()
+        barycenter = outputs['barycenter'].float()
+        residual = outputs['residual'].float()
         labels = batch['degradation_label']
 
         reconstruction = self.reconstruction(prediction, target)

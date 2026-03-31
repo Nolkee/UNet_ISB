@@ -191,7 +191,7 @@ def evaluate(model, criterion, loader, device, amp, epoch: int, val_save_count: 
 
             with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                 outputs = model(batch['image'], batch['time_step'])
-                _, metrics = criterion(outputs, batch)
+            _, metrics = criterion(outputs, batch)
 
             predictions = outputs['prediction']
             batch_size = batch['image'].shape[0]
@@ -305,7 +305,7 @@ def train_model(
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=args.amp):
                     outputs = model(batch['image'], batch['time_step'])
-                    loss, metrics = criterion(outputs, batch)
+                loss, metrics = criterion(outputs, batch)
 
                 raise_if_non_finite_loss(loss, metrics, batch, outputs, epoch=epoch, step=step)
 

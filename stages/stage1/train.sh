@@ -23,8 +23,7 @@ CMD=(
   --device cuda
   --epochs 50
   --batch-size 8
-  --learning-rate 2e-4
-  --amp
+  --learning-rate 1e-4
   --in-channels 1
   --out-channels 1
   --image-size 320
