@@ -82,7 +82,25 @@ def summarize_metrics(history):
     if not history:
         return {}
     keys = history[0].keys()
-    return {key: sum(item[key] for item in history) / len(history) for key in keys}
+    summary = {}
+    for key in keys:
+        values = [item[key] for item in history]
+        if key.endswith('_min'):
+            summary[key] = min(values)
+        elif key.endswith('_max'):
+            summary[key] = max(values)
+        else:
+            summary[key] = sum(values) / len(values)
+    return summary
+
+
+def format_metric(key: str, value: float) -> str:
+    precision = 6 if key in {'loss_high_frequency', 'loss_patch_nce'} or key.startswith('mask_reg_') else 4
+    return f'{key}={value:.{precision}f}'
+
+
+def format_metrics(metrics: dict[str, float]) -> str:
+    return ' '.join(format_metric(key, value) for key, value in metrics.items())
 
 
 def raise_if_non_finite_loss(loss, metrics, batch, outputs, epoch: int, step: int) -> None:
@@ -97,7 +115,7 @@ def raise_if_non_finite_loss(loss, metrics, batch, outputs, epoch: int, step: in
     prediction = outputs['prediction'].detach().float()
     image = batch['image'].detach().float()
     target = batch['target'].detach().float()
-    metric_summary = ' '.join(f'{key}={float(value.detach().item())}' for key, value in metrics.items())
+    metric_summary = format_metrics({key: float(value.detach().item()) for key, value in metrics.items()})
     logging.error(
         'Non-finite Stage-1 loss at epoch=%d step=%d ids=%s invalid=%s image_range=[%.6f, %.6f] '
         'target_range=[%.6f, %.6f] pred_range=[%.6f, %.6f] %s',
@@ -323,7 +341,7 @@ def train_model(
                 pbar.set_postfix(loss=float(metrics['loss_total'].item()))
 
         train_metrics = summarize_metrics(epoch_history)
-        logging.info('[train] %s', ' '.join(f'{k}={v:.4f}' for k, v in train_metrics.items()))
+        logging.info('[train] %s', format_metrics(train_metrics))
 
         val_metrics = {}
         if val_loader is not None:
@@ -337,7 +355,7 @@ def train_model(
                 val_save_count=args.val_save_count,
                 val_save_dir=val_save_dir,
             )
-            logging.info('[val] %s', ' '.join(f'{k}={v:.4f}' for k, v in val_metrics.items()))
+            logging.info('[val] %s', format_metrics(val_metrics))
 
         checkpoint = {
             'epoch': epoch,

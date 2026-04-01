@@ -161,5 +161,8 @@ class Stage1RestorationLoss(nn.Module):
             'loss_patch_nce': patch_nce.detach(),
             'loss_bro': bro.detach(),
             'loss_irc': irc.detach(),
+            'mask_reg_mean': mask_reg.mean().detach(),
+            'mask_reg_min': mask_reg.amin().detach(),
+            'mask_reg_max': mask_reg.amax().detach(),
         }
         return total, metrics
