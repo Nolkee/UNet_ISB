@@ -166,3 +166,76 @@ class Stage1RestorationLoss(nn.Module):
             'mask_reg_max': mask_reg.amax().detach(),
         }
         return total, metrics
+
+
+# ---------------------------------------------------------------------------
+# Stage-2 adversarial losses
+# ---------------------------------------------------------------------------
+
+class LSGANLoss(nn.Module):
+    """Least-squares GAN loss (Mao et al., 2017).
+
+    Discriminator: ``L_D = 0.5 * mean((D(real) - 1)^2) + 0.5 * mean(D(fake)^2)``
+    Generator:     ``L_G = 0.5 * mean((D(fake) - 1)^2)``
+    """
+
+    def forward_d(self, real_scores: torch.Tensor, fake_scores: torch.Tensor) -> torch.Tensor:
+        return 0.5 * (torch.mean((real_scores - 1.0) ** 2) + torch.mean(fake_scores ** 2))
+
+    def forward_g(self, fake_scores: torch.Tensor) -> torch.Tensor:
+        return 0.5 * torch.mean((fake_scores - 1.0) ** 2)
+
+
+class Stage2RestorationLoss(nn.Module):
+    """Composite loss for Stage-2: content (delegated to Stage-1) + adversarial.
+
+    The adversarial weight is linearly ramped from 0 to ``adversarial_weight`` over
+    ``warmup_epochs`` to protect Stage-1 features from sudden gradient competition.
+
+    Parameters
+    ----------
+    stage1_criterion : Stage1RestorationLoss
+        Pre-initialised Stage-1 loss module (reused, not cloned).
+    adversarial_weight : float
+        Target weight for the generator adversarial loss after warmup.
+    warmup_epochs : int
+        Number of epochs over which ``adversarial_weight`` ramps from 0 to target.
+    """
+
+    def __init__(
+        self,
+        stage1_criterion: Stage1RestorationLoss,
+        adversarial_weight: float = 1.0,
+        warmup_epochs: int = 5,
+    ) -> None:
+        super().__init__()
+        self.stage1_criterion = stage1_criterion
+        self.adversarial_weight = adversarial_weight
+        self.warmup_epochs = warmup_epochs
+        self.gan_loss = LSGANLoss()
+
+    def _adv_weight(self, current_epoch: int) -> float:
+        if self.warmup_epochs <= 0:
+            return self.adversarial_weight
+        ramp = min(current_epoch / self.warmup_epochs, 1.0)
+        return self.adversarial_weight * ramp
+
+    def forward(
+        self,
+        outputs: dict[str, torch.Tensor | list[torch.Tensor]],
+        batch: dict[str, torch.Tensor],
+        fake_scores: torch.Tensor,
+        current_epoch: int,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        content_loss, content_metrics = self.stage1_criterion(outputs, batch)
+
+        adv_g = self.gan_loss.forward_g(fake_scores)
+        adv_w = self._adv_weight(current_epoch)
+        total = content_loss + adv_w * adv_g
+
+        metrics = dict(content_metrics)
+        metrics['loss_total'] = total.detach()
+        metrics['loss_content'] = content_loss.detach()
+        metrics['loss_adv_g'] = adv_g.detach()
+        metrics['adv_weight'] = fake_scores.new_tensor(adv_w).detach()
+        return total, metrics
