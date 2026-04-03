@@ -32,7 +32,7 @@ CMD=(
 
   # Training hyperparameters
   --epochs 50
-  --batch-size 4
+  --batch-size 8
   --g-lr 1e-4
   --d-lr 2e-4
 
