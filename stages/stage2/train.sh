@@ -15,7 +15,7 @@ VAL_TARGET="/home/cavin/CJX/fastMRIdata/MRI_dataset/test_dataset/test_slices/rss
 VAL_MANIFEST="/home/cavin/CJX/fastMRIdata/MRI_dataset/test_dataset/test_slices/manifest_test.csv"
 
 # ---- Configurable paths ----
-STAGE1_CKPT="${STAGE1_CKPT:-$REPO_ROOT/checkpoints_stage1_detail_mild/best_stage1.pth}"
+STAGE1_CKPT="${STAGE1_CKPT:-$REPO_ROOT/checkpoints_stage1_tuning_20260401_163223/detail_mild/best_stage1.pth}"
 SAVE_DIR="${SAVE_DIR:-$REPO_ROOT/checkpoints_stage2}"
 VAL_SAVE_COUNT="${VAL_SAVE_COUNT:-4}"
 
