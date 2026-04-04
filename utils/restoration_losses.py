@@ -239,3 +239,178 @@ class Stage2RestorationLoss(nn.Module):
         metrics['loss_adv_g'] = adv_g.detach()
         metrics['adv_weight'] = fake_scores.new_tensor(adv_w).detach()
         return total, metrics
+
+
+# ---------------------------------------------------------------------------
+# Stage-3 barycenter regularization losses
+# ---------------------------------------------------------------------------
+
+class GradientReversalFunction(torch.autograd.Function):
+    """Identity in forward pass, negated & scaled gradients in backward."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, lambda_: float) -> torch.Tensor:
+        ctx.lambda_ = lambda_
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        return -ctx.lambda_ * grad_output, None
+
+
+class DegradationClassifier(nn.Module):
+    """Small MLP that predicts degradation class from pooled features.
+
+    A Gradient Reversal Layer is applied *before* the classifier so that
+    gradients flowing back to the encoder encourage degradation-invariant
+    representations.
+
+    Parameters
+    ----------
+    feature_dim : int
+        Spatial-feature channel count (default 1024 for base_channels=64).
+    hidden_dim : int
+        Hidden layer size.
+    num_classes : int
+        Number of discrete degradation categories.
+    """
+
+    def __init__(self, feature_dim: int = 1024, hidden_dim: int = 256, num_classes: int = 4) -> None:
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, num_classes),
+        )
+
+    def forward(self, features: torch.Tensor, grl_lambda: float) -> torch.Tensor:
+        """Return class logits ``[B, K]`` from spatial features ``[B, C, H, W]``."""
+        pooled = F.adaptive_avg_pool2d(features, 1).flatten(1)
+        reversed_features = GradientReversalFunction.apply(pooled, grl_lambda)
+        return self.classifier(reversed_features)
+
+
+class BarycenterAdversarialLoss(nn.Module):
+    """Wasserstein-Barycenter–inspired degradation-invariance loss (L_WB).
+
+    Applies cross-entropy on the degradation classifier's output.  Because the
+    classifier sits behind a GRL, minimising this loss with respect to the
+    generator pushes ``b`` toward degradation-invariant features.
+
+    Parameters
+    ----------
+    feature_dim : int
+        Channel count of the barycenter tensor.
+    hidden_dim : int
+        Hidden size of the degradation classifier.
+    num_classes : int
+        Number of discrete degradation categories.
+    """
+
+    def __init__(self, feature_dim: int = 1024, hidden_dim: int = 256, num_classes: int = 4) -> None:
+        super().__init__()
+        self.classifier = DegradationClassifier(feature_dim, hidden_dim, num_classes)
+
+    def forward(
+        self, barycenter: torch.Tensor, labels: torch.Tensor, grl_lambda: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(loss, accuracy)`` for monitoring.
+
+        Samples with ``label < 0`` are skipped.  If fewer than 2 valid samples
+        exist the loss is zero and accuracy is -1 (sentinel).
+        """
+        valid = labels >= 0
+        if valid.sum() < 2:
+            return barycenter.new_tensor(0.0), barycenter.new_tensor(-1.0)
+
+        logits = self.classifier(barycenter[valid], grl_lambda)
+        target = labels[valid]
+        loss = F.cross_entropy(logits, target)
+        accuracy = (logits.argmax(dim=1) == target).float().mean()
+        return loss, accuracy
+
+
+class Stage3RestorationLoss(nn.Module):
+    """Composite Stage-3 loss: Stage-2 losses + barycenter adversarial (L_WB).
+
+    L_WB weight is linearly ramped from 0 to ``wb_weight`` over
+    ``wb_warmup_epochs``.  The GRL lambda is independently ramped from 0 to
+    ``grl_max_lambda`` over ``grl_ramp_epochs`` for gradient magnitude control.
+
+    Parameters
+    ----------
+    stage2_criterion : Stage2RestorationLoss
+        Pre-initialised Stage-2 loss module (reused).
+    wb_weight : float
+        Target weight for L_WB after warmup.
+    wb_warmup_epochs : int
+        Epochs to ramp ``wb_weight`` from 0 to target.
+    grl_max_lambda : float
+        Maximum GRL scaling factor.
+    grl_ramp_epochs : int
+        Epochs to ramp GRL lambda from 0 to ``grl_max_lambda``.
+    feature_dim : int
+        Barycenter channel count.
+    hidden_dim : int
+        Degradation classifier hidden size.
+    num_classes : int
+        Number of degradation categories.
+    """
+
+    def __init__(
+        self,
+        stage2_criterion: Stage2RestorationLoss,
+        wb_weight: float = 0.1,
+        wb_warmup_epochs: int = 5,
+        grl_max_lambda: float = 1.0,
+        grl_ramp_epochs: int = 10,
+        feature_dim: int = 1024,
+        hidden_dim: int = 256,
+        num_classes: int = 4,
+    ) -> None:
+        super().__init__()
+        self.stage2_criterion = stage2_criterion
+        self.wb_weight = wb_weight
+        self.wb_warmup_epochs = wb_warmup_epochs
+        self.grl_max_lambda = grl_max_lambda
+        self.grl_ramp_epochs = grl_ramp_epochs
+        self.wb_loss = BarycenterAdversarialLoss(feature_dim, hidden_dim, num_classes)
+
+    def _wb_weight(self, current_epoch: int) -> float:
+        if self.wb_warmup_epochs <= 0:
+            return self.wb_weight
+        return self.wb_weight * min(current_epoch / self.wb_warmup_epochs, 1.0)
+
+    def _grl_lambda(self, current_epoch: int) -> float:
+        if self.grl_ramp_epochs <= 0:
+            return self.grl_max_lambda
+        return self.grl_max_lambda * min(current_epoch / self.grl_ramp_epochs, 1.0)
+
+    def forward(
+        self,
+        outputs: dict[str, torch.Tensor | list[torch.Tensor]],
+        batch: dict[str, torch.Tensor],
+        fake_scores: torch.Tensor,
+        current_epoch: int,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        # Delegate to Stage-2 (content + GAN)
+        stage2_loss, stage2_metrics = self.stage2_criterion(outputs, batch, fake_scores, current_epoch)
+
+        # Barycenter adversarial (L_WB)
+        grl_lam = self._grl_lambda(current_epoch)
+        wb_loss_val, wb_acc = self.wb_loss(
+            outputs['barycenter'].float(), batch['degradation_label'], grl_lam,
+        )
+        wb_w = self._wb_weight(current_epoch)
+        total = stage2_loss + wb_w * wb_loss_val
+
+        metrics = dict(stage2_metrics)
+        metrics['loss_total'] = total.detach()
+        metrics['loss_stage2'] = stage2_loss.detach()
+        metrics['loss_wb'] = wb_loss_val.detach()
+        metrics['wb_weight'] = fake_scores.new_tensor(wb_w).detach()
+        metrics['wb_classifier_acc'] = wb_acc.detach()
+        metrics['grl_lambda'] = fake_scores.new_tensor(grl_lam).detach()
+        return total, metrics
