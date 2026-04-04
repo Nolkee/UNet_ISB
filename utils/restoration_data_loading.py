@@ -106,8 +106,8 @@ class PairedRestorationDataset(Dataset):
 
                 label = self._resolve_label(
                     row.get('degradation_label'),
-                    row.get('degradation_type'),
-                    row.get('degradation_level'),
+                    row.get('degradation_type') or row.get('noise_type'),
+                    row.get('degradation_level') or row.get('sigma'),
                 )
                 sample_id = self._resolve_sample_id(row, input_path)
                 samples.append(
