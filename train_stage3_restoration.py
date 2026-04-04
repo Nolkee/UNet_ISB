@@ -125,6 +125,8 @@ def create_argparser():
                         help='Maximum GRL scaling factor')
     parser.add_argument('--grl-ramp-epochs', type=int, default=10,
                         help='Epochs to ramp GRL lambda from 0 to max')
+    parser.add_argument('--irc-warmup-epochs', type=int, default=5,
+                        help='Epochs to ramp IRC weight from 0 to target (projector was untrained in Stage-2)')
     parser.add_argument('--num-degradation-classes', type=int, default=0,
                         help='Number of degradation classes (0 = auto-detect from dataset)')
     parser.add_argument('--wb-hidden-dim', type=int, default=256,
@@ -448,6 +450,7 @@ def main():
         feature_dim=residual_feature_dim,
         hidden_dim=args.wb_hidden_dim,
         num_classes=num_classes,
+        irc_warmup_epochs=args.irc_warmup_epochs,
     ).to(device)
 
     gan_loss = LSGANLoss()

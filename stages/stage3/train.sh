@@ -62,6 +62,7 @@ CMD=(
   --wb-warmup-epochs 5
   --grl-max-lambda 1.0
   --grl-ramp-epochs 10
+  --irc-warmup-epochs 5
   --num-degradation-classes 0
   --wb-hidden-dim 256
 

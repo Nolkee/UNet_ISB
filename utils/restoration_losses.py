@@ -369,6 +369,7 @@ class Stage3RestorationLoss(nn.Module):
         feature_dim: int = 1024,
         hidden_dim: int = 256,
         num_classes: int = 4,
+        irc_warmup_epochs: int = 5,
     ) -> None:
         super().__init__()
         self.stage2_criterion = stage2_criterion
@@ -376,7 +377,25 @@ class Stage3RestorationLoss(nn.Module):
         self.wb_warmup_epochs = wb_warmup_epochs
         self.grl_max_lambda = grl_max_lambda
         self.grl_ramp_epochs = grl_ramp_epochs
+        self.irc_warmup_epochs = irc_warmup_epochs
         self.wb_loss = BarycenterAdversarialLoss(feature_dim, hidden_dim, num_classes)
+
+        # Re-initialise IRC projector — it was never trained in Stage-2 (weight=0)
+        irc = self.stage2_criterion.stage1_criterion.irc
+        for module in irc.projector.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.kaiming_normal_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+        # Store the target IRC weight and zero out IRC initially for warmup
+        self._irc_target_weight = self.stage2_criterion.stage1_criterion.irc_weight
+        self.stage2_criterion.stage1_criterion.irc_weight = 0.0
+
+    def _irc_weight(self, current_epoch: int) -> float:
+        if self.irc_warmup_epochs <= 0:
+            return self._irc_target_weight
+        return self._irc_target_weight * min(current_epoch / self.irc_warmup_epochs, 1.0)
 
     def _wb_weight(self, current_epoch: int) -> float:
         if self.wb_warmup_epochs <= 0:
@@ -395,6 +414,9 @@ class Stage3RestorationLoss(nn.Module):
         fake_scores: torch.Tensor,
         current_epoch: int,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        # Ramp IRC weight each step (overwrite stage1's attribute before delegation)
+        self.stage2_criterion.stage1_criterion.irc_weight = self._irc_weight(current_epoch)
+
         # Delegate to Stage-2 (content + GAN)
         stage2_loss, stage2_metrics = self.stage2_criterion(outputs, batch, fake_scores, current_epoch)
 
@@ -413,4 +435,5 @@ class Stage3RestorationLoss(nn.Module):
         metrics['wb_weight'] = fake_scores.new_tensor(wb_w).detach()
         metrics['wb_classifier_acc'] = wb_acc.detach()
         metrics['grl_lambda'] = fake_scores.new_tensor(grl_lam).detach()
+        metrics['irc_weight'] = fake_scores.new_tensor(self._irc_weight(current_epoch)).detach()
         return total, metrics
