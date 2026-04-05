@@ -257,11 +257,30 @@ def train_model(
     (save_dir / 'train_args.json').write_text(json.dumps(vars(args), indent=2))
     val_save_dir = save_dir / args.val_save_subdir if args.val_save_count > 0 else None
 
+    # Snapshot for NaN rollback — keeps a known-good state in CPU memory
+    def take_snapshot():
+        return {
+            'g': {k: v.detach().cpu().clone() for k, v in generator.state_dict().items()},
+            'd': {k: v.detach().cpu().clone() for k, v in discriminator.state_dict().items()},
+            'c': {k: v.detach().cpu().clone() for k, v in stage3_criterion.state_dict().items()},
+        }
+
+    def restore_snapshot(snap):
+        generator.load_state_dict({k: v.to(device) for k, v in snap['g'].items()})
+        discriminator.load_state_dict({k: v.to(device) for k, v in snap['d'].items()})
+        stage3_criterion.load_state_dict({k: v.to(device) for k, v in snap['c'].items()})
+
+    snapshot = take_snapshot()
+    nan_count_in_epoch = 0
+    max_nan_per_epoch = 5  # Too many NaN steps → rollback entire epoch and stop
+
     for epoch in range(start_epoch, args.epochs + 1):
         generator.train()
         discriminator.train()
         stage3_criterion.train()
         epoch_history = []
+        nan_count_in_epoch = 0
+        epoch_snapshot = take_snapshot()  # snapshot at epoch start
 
         with tqdm(total=len(train_loader.dataset), desc=f'Epoch {epoch}/{args.epochs}', unit='img') as pbar:
             for step, batch in enumerate(train_loader, start=1):
@@ -283,7 +302,14 @@ def train_model(
                     d_loss = gan_loss.forward_d(real_scores, fake_scores_d)
 
                 if not torch.isfinite(d_loss):
-                    logging.warning('Skipping step %d (epoch %d): non-finite d_loss', step, epoch)
+                    nan_count_in_epoch += 1
+                    logging.warning('NaN d_loss at step %d (epoch %d), rolling back to last good state [%d/%d]',
+                                    step, epoch, nan_count_in_epoch, max_nan_per_epoch)
+                    restore_snapshot(snapshot)
+                    if nan_count_in_epoch >= max_nan_per_epoch:
+                        logging.error('Too many NaN steps in epoch %d, rolling back to epoch start and stopping', epoch)
+                        restore_snapshot(epoch_snapshot)
+                        break
                     pbar.update(batch['image'].shape[0])
                     continue
 
@@ -300,7 +326,14 @@ def train_model(
                     g_loss, metrics = stage3_criterion(outputs, batch, fake_scores_g, epoch)
 
                 if not torch.isfinite(g_loss):
-                    logging.warning('Skipping step %d (epoch %d): non-finite g_loss', step, epoch)
+                    nan_count_in_epoch += 1
+                    logging.warning('NaN g_loss at step %d (epoch %d), rolling back to last good state [%d/%d]',
+                                    step, epoch, nan_count_in_epoch, max_nan_per_epoch)
+                    restore_snapshot(snapshot)
+                    if nan_count_in_epoch >= max_nan_per_epoch:
+                        logging.error('Too many NaN steps in epoch %d, rolling back to epoch start and stopping', epoch)
+                        restore_snapshot(epoch_snapshot)
+                        break
                     pbar.update(batch['image'].shape[0])
                     continue
 
@@ -311,6 +344,9 @@ def train_model(
                 )
                 g_scaler.step(g_optimizer)
                 g_scaler.update()
+
+                # This step succeeded — update snapshot
+                snapshot = take_snapshot()
 
                 # ---- Logging ----
                 d_real_acc, d_fake_acc = compute_d_accuracy(real_scores.detach(), fake_scores_d.detach())
@@ -329,6 +365,25 @@ def train_model(
                     dr=f'{d_real_acc:.0%}',
                     df=f'{d_fake_acc:.0%}',
                 )
+
+        if nan_count_in_epoch >= max_nan_per_epoch:
+            logging.error('Training stopped early at epoch %d due to excessive NaN. '
+                          'Model rolled back to epoch start.', epoch)
+            # Save the rolled-back model as a recovery checkpoint
+            recovery = {
+                'epoch': epoch - 1,
+                'generator_state_dict': generator.state_dict(),
+                'discriminator_state_dict': discriminator.state_dict(),
+                'criterion_state_dict': stage3_criterion.state_dict(),
+                'g_optimizer_state_dict': g_optimizer.state_dict(),
+                'd_optimizer_state_dict': d_optimizer.state_dict(),
+                'args': vars(args),
+                'train_metrics': {},
+                'val_metrics': {},
+            }
+            torch.save(recovery, save_dir / 'recovery_before_nan.pth')
+            logging.info('Saved recovery checkpoint to %s', save_dir / 'recovery_before_nan.pth')
+            break
 
         train_metrics = summarize_metrics(epoch_history)
         logging.info('[train] %s', format_metrics(train_metrics))
