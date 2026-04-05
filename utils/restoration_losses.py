@@ -90,6 +90,8 @@ class ResidualContrastiveLoss(nn.Module):
         similarity = torch.matmul(features, features.t()) / self.temperature
         logits_mask = ~torch.eye(similarity.size(0), dtype=torch.bool, device=similarity.device)
         similarity = similarity - similarity.max(dim=1, keepdim=True).values.detach()
+        # Clamp to prevent exp() overflow
+        similarity = similarity.clamp(min=-30.0, max=30.0)
 
         positives = (labels[:, None] == labels[None, :]) & logits_mask
         positive_counts = positives.sum(dim=1)
@@ -99,7 +101,9 @@ class ResidualContrastiveLoss(nn.Module):
         exp_similarity = torch.exp(similarity) * logits_mask
         log_prob = similarity - torch.log(exp_similarity.sum(dim=1, keepdim=True).clamp_min(1e-6))
         mean_log_prob_pos = (positives * log_prob).sum(dim=1) / positive_counts.clamp_min(1)
-        return -mean_log_prob_pos[positive_counts > 0].mean()
+        loss = -mean_log_prob_pos[positive_counts > 0].mean()
+        # Final safety clamp — prevent extreme values from destabilising training
+        return loss.clamp(max=5.0)
 
 
 class Stage1RestorationLoss(nn.Module):

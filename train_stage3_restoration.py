@@ -282,7 +282,11 @@ def train_model(
                     fake_scores_d = discriminator(fake.detach())
                     d_loss = gan_loss.forward_d(real_scores, fake_scores_d)
 
-                raise_if_non_finite(d_loss, 'd_loss', epoch, step)
+                if not torch.isfinite(d_loss):
+                    logging.warning('Skipping step %d (epoch %d): non-finite d_loss', step, epoch)
+                    pbar.update(batch['image'].shape[0])
+                    continue
+
                 d_scaler.scale(d_loss).backward()
                 d_scaler.unscale_(d_optimizer)
                 torch.nn.utils.clip_grad_norm_(discriminator.parameters(), args.grad_clip)
@@ -295,7 +299,11 @@ def train_model(
                     fake_scores_g = discriminator(fake)
                     g_loss, metrics = stage3_criterion(outputs, batch, fake_scores_g, epoch)
 
-                raise_if_non_finite(g_loss, 'g_loss', epoch, step)
+                if not torch.isfinite(g_loss):
+                    logging.warning('Skipping step %d (epoch %d): non-finite g_loss', step, epoch)
+                    pbar.update(batch['image'].shape[0])
+                    continue
+
                 g_scaler.scale(g_loss).backward()
                 g_scaler.unscale_(g_optimizer)
                 torch.nn.utils.clip_grad_norm_(
