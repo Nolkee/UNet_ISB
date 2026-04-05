@@ -51,7 +51,7 @@ CMD=(
   --high-frequency-weight 0.8
   --patch-nce-weight 0.15
   --bro-weight 0.05
-  --irc-weight 0.05
+  --irc-weight 0.01
 
   # GAN adversarial (no re-warmup)
   --adv-weight 1.0
@@ -62,6 +62,7 @@ CMD=(
   --wb-warmup-epochs 5
   --grl-max-lambda 1.0
   --grl-ramp-epochs 10
+  --contrastive-temperature 0.5
   --irc-warmup-epochs 5
   --num-degradation-classes 0
   --wb-hidden-dim 256
