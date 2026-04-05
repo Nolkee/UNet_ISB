@@ -51,7 +51,7 @@ CMD=(
   --high-frequency-weight 0.8
   --patch-nce-weight 0.15
   --bro-weight 0.05
-  --irc-weight 0.01
+  --irc-weight 0.0
 
   # GAN adversarial (no re-warmup)
   --adv-weight 1.0
