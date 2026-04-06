@@ -272,7 +272,9 @@ def train_model(
 
     snapshot = take_snapshot()
     nan_count_in_epoch = 0
-    max_nan_per_epoch = 5  # Too many NaN steps → rollback entire epoch and stop
+    max_nan_per_epoch = 5
+    total_reductions = 0
+    max_reductions = 3  # After 3 auto-reductions, actually stop
 
     for epoch in range(start_epoch, args.epochs + 1):
         generator.train()
@@ -303,12 +305,10 @@ def train_model(
 
                 if not torch.isfinite(d_loss):
                     nan_count_in_epoch += 1
-                    logging.warning('NaN d_loss at step %d (epoch %d), rolling back to last good state [%d/%d]',
+                    logging.warning('NaN d_loss at step %d (epoch %d), rolling back [%d/%d]',
                                     step, epoch, nan_count_in_epoch, max_nan_per_epoch)
                     restore_snapshot(snapshot)
                     if nan_count_in_epoch >= max_nan_per_epoch:
-                        logging.error('Too many NaN steps in epoch %d, rolling back to epoch start and stopping', epoch)
-                        restore_snapshot(epoch_snapshot)
                         break
                     pbar.update(batch['image'].shape[0])
                     continue
@@ -327,12 +327,10 @@ def train_model(
 
                 if not torch.isfinite(g_loss):
                     nan_count_in_epoch += 1
-                    logging.warning('NaN g_loss at step %d (epoch %d), rolling back to last good state [%d/%d]',
+                    logging.warning('NaN g_loss at step %d (epoch %d), rolling back [%d/%d]',
                                     step, epoch, nan_count_in_epoch, max_nan_per_epoch)
                     restore_snapshot(snapshot)
                     if nan_count_in_epoch >= max_nan_per_epoch:
-                        logging.error('Too many NaN steps in epoch %d, rolling back to epoch start and stopping', epoch)
-                        restore_snapshot(epoch_snapshot)
                         break
                     pbar.update(batch['image'].shape[0])
                     continue
@@ -367,23 +365,39 @@ def train_model(
                 )
 
         if nan_count_in_epoch >= max_nan_per_epoch:
-            logging.error('Training stopped early at epoch %d due to excessive NaN. '
-                          'Model rolled back to epoch start.', epoch)
-            # Save the rolled-back model as a recovery checkpoint
-            recovery = {
-                'epoch': epoch - 1,
-                'generator_state_dict': generator.state_dict(),
-                'discriminator_state_dict': discriminator.state_dict(),
-                'criterion_state_dict': stage3_criterion.state_dict(),
-                'g_optimizer_state_dict': g_optimizer.state_dict(),
-                'd_optimizer_state_dict': d_optimizer.state_dict(),
-                'args': vars(args),
-                'train_metrics': {},
-                'val_metrics': {},
-            }
-            torch.save(recovery, save_dir / 'recovery_before_nan.pth')
-            logging.info('Saved recovery checkpoint to %s', save_dir / 'recovery_before_nan.pth')
-            break
+            # Auto-reduce GRL max lambda and rollback to epoch start
+            restore_snapshot(epoch_snapshot)
+            total_reductions += 1
+            old_grl = stage3_criterion.grl_max_lambda
+            stage3_criterion.grl_max_lambda = old_grl * 0.5
+            old_wb = stage3_criterion.wb_weight
+            stage3_criterion.wb_weight = old_wb * 0.5
+            logging.warning(
+                'Epoch %d: excessive NaN [reduction %d/%d]. '
+                'Rolled back to epoch start. grl_max_lambda: %.4f -> %.4f, wb_weight: %.4f -> %.4f',
+                epoch, total_reductions, max_reductions,
+                old_grl, stage3_criterion.grl_max_lambda,
+                old_wb, stage3_criterion.wb_weight,
+            )
+            # Update snapshot to the rolled-back state
+            snapshot = take_snapshot()
+            if total_reductions >= max_reductions:
+                logging.error('Reached max %d auto-reductions. Saving checkpoint and stopping.', max_reductions)
+                recovery = {
+                    'epoch': epoch - 1,
+                    'generator_state_dict': generator.state_dict(),
+                    'discriminator_state_dict': discriminator.state_dict(),
+                    'criterion_state_dict': stage3_criterion.state_dict(),
+                    'g_optimizer_state_dict': g_optimizer.state_dict(),
+                    'd_optimizer_state_dict': d_optimizer.state_dict(),
+                    'args': vars(args),
+                    'train_metrics': {},
+                    'val_metrics': {},
+                }
+                torch.save(recovery, save_dir / 'recovery_before_nan.pth')
+                logging.info('Saved recovery checkpoint to %s', save_dir / 'recovery_before_nan.pth')
+                break
+            continue  # Retry the same epoch with reduced GRL
 
         train_metrics = summarize_metrics(epoch_history)
         logging.info('[train] %s', format_metrics(train_metrics))
