@@ -331,7 +331,7 @@ class BarycenterAdversarialLoss(nn.Module):
 
         logits = self.classifier(barycenter[valid], grl_lambda)
         target = labels[valid]
-        loss = F.cross_entropy(logits, target)
+        loss = F.cross_entropy(logits, target).clamp(max=3.0)
         accuracy = (logits.argmax(dim=1) == target).float().mean()
         return loss, accuracy
 
