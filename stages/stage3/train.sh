@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
-# Stage-3: Barycenter Regularization (DANN + GRL)
-# GAN 保留自 Stage-2；新增 L_WB + re-enable IRC
+# Stage-3: Barycenter Regularization (stable two-phase)
+# Phase A: GAN + WB；Phase B: generator-only fine-tuning after GAN saturation/stop epoch
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -30,7 +30,7 @@ CMD=(
   --save-dir "$SAVE_DIR"
   --device cuda
 
-  # Training hyperparameters (LR halved from Stage-2)
+  # Training hyperparameters
   --epochs 50
   --batch-size 8
   --g-lr 5e-5
@@ -42,7 +42,7 @@ CMD=(
   --image-size 320
   --crop-size 256
 
-  # Discriminator (same as Stage-2)
+  # Discriminator
   --ndf 64
   --n-layers 3
 
@@ -53,11 +53,11 @@ CMD=(
   --bro-weight 0.05
   --irc-weight 0.0
 
-  # GAN adversarial (no re-warmup)
+  # GAN adversarial
   --adv-weight 1.0
   --adv-warmup-epochs 0
 
-  # Barycenter regularization (NEW)
+  # Barycenter regularization
   --wb-weight 0.05
   --wb-warmup-epochs 10
   --grl-max-lambda 0.5
@@ -66,6 +66,12 @@ CMD=(
   --irc-warmup-epochs 5
   --num-degradation-classes 0
   --wb-hidden-dim 256
+
+  # Stable two-phase switch
+  --gan-stop-epoch 20
+  --gan-saturation-threshold 0.95
+  --gan-saturation-patience 2
+  --post-gan-lr-scale 0.5
 
   --save-every 5
   --val-save-count "$VAL_SAVE_COUNT"
@@ -80,7 +86,7 @@ else
 fi
 
 echo "=========================================="
-echo " Stage-3: Barycenter Regularization"
+echo " Stage-3: Stable Two-Phase Training"
 echo " Stage-2 checkpoint: $STAGE2_CKPT"
 echo " Save directory:     $SAVE_DIR"
 echo "=========================================="

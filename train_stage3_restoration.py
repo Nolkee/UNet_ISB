@@ -132,6 +132,16 @@ def create_argparser():
     parser.add_argument('--wb-hidden-dim', type=int, default=256,
                         help='Hidden dimension of degradation classifier')
 
+    # Stable Stage-3 phase switch
+    parser.add_argument('--gan-stop-epoch', type=int, default=20,
+                        help='After this epoch finishes, disable GAN updates for stabilization (0 = keep GAN throughout)')
+    parser.add_argument('--gan-saturation-threshold', type=float, default=0.95,
+                        help='Epoch-average discriminator accuracy threshold used for saturation detection')
+    parser.add_argument('--gan-saturation-patience', type=int, default=2,
+                        help='Consecutive saturated epochs required before disabling GAN')
+    parser.add_argument('--post-gan-lr-scale', type=float, default=0.5,
+                        help='Scale generator learning rate once when switching to generator-only fine-tuning')
+
     return parser
 
 
@@ -249,6 +259,9 @@ def train_model(
     args,
     start_epoch: int = 1,
     best_val: float = float('inf'),
+    gan_enabled: bool = True,
+    gan_disabled_epoch: int | None = None,
+    saturation_streak: int = 0,
 ):
     g_scaler = torch.amp.GradScaler('cuda', enabled=args.amp and device.type == 'cuda')
     d_scaler = torch.amp.GradScaler('cuda', enabled=args.amp and device.type == 'cuda')
@@ -256,6 +269,32 @@ def train_model(
     save_dir.mkdir(parents=True, exist_ok=True)
     (save_dir / 'train_args.json').write_text(json.dumps(vars(args), indent=2))
     val_save_dir = save_dir / args.val_save_subdir if args.val_save_count > 0 else None
+    stage2_adv_weight = stage3_criterion.stage2_criterion.adversarial_weight
+
+    def set_gan_enabled(enabled: bool) -> None:
+        stage3_criterion.stage2_criterion.adversarial_weight = stage2_adv_weight if enabled else 0.0
+        requires_grad = enabled
+        discriminator.train(enabled)
+        for parameter in discriminator.parameters():
+            parameter.requires_grad_(requires_grad)
+
+    def disable_gan(reason: str, current_epoch: int) -> None:
+        nonlocal gan_enabled, gan_disabled_epoch
+        if not gan_enabled:
+            return
+        gan_enabled = False
+        gan_disabled_epoch = current_epoch
+        set_gan_enabled(False)
+        if args.post_gan_lr_scale != 1.0:
+            for param_group in g_optimizer.param_groups:
+                param_group['lr'] *= args.post_gan_lr_scale
+        logging.info(
+            'Disabled GAN after epoch %d (%s); generator lr scale=%.4f current_g_lr=%s',
+            current_epoch,
+            reason,
+            args.post_gan_lr_scale,
+            ','.join(f'{group["lr"]:.6g}' for group in g_optimizer.param_groups),
+        )
 
     # Snapshot for NaN rollback — keeps a known-good state in CPU memory
     def take_snapshot():
@@ -269,7 +308,9 @@ def train_model(
         generator.load_state_dict({k: v.to(device) for k, v in snap['g'].items()})
         discriminator.load_state_dict({k: v.to(device) for k, v in snap['d'].items()})
         stage3_criterion.load_state_dict({k: v.to(device) for k, v in snap['c'].items()})
+        set_gan_enabled(gan_enabled)
 
+    set_gan_enabled(gan_enabled)
     snapshot = take_snapshot()
     nan_count_in_epoch = 0
     max_nan_per_epoch = 5
@@ -278,7 +319,10 @@ def train_model(
 
     for epoch in range(start_epoch, args.epochs + 1):
         generator.train()
-        discriminator.train()
+        if gan_enabled:
+            discriminator.train()
+        else:
+            discriminator.eval()
         stage3_criterion.train()
         epoch_history = []
         nan_count_in_epoch = 0
@@ -296,33 +340,43 @@ def train_model(
                 fake = outputs['prediction']
                 real = batch['target']
 
-                # ---- Update Discriminator ----
-                d_optimizer.zero_grad(set_to_none=True)
-                with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=args.amp):
-                    real_scores = discriminator(real)
-                    fake_scores_d = discriminator(fake.detach())
-                    d_loss = gan_loss.forward_d(real_scores, fake_scores_d)
+                d_loss_value = 0.0
+                d_real_acc = 0.0
+                d_fake_acc = 0.0
 
-                if not torch.isfinite(d_loss):
-                    nan_count_in_epoch += 1
-                    logging.warning('NaN d_loss at step %d (epoch %d), rolling back [%d/%d]',
-                                    step, epoch, nan_count_in_epoch, max_nan_per_epoch)
-                    restore_snapshot(snapshot)
-                    if nan_count_in_epoch >= max_nan_per_epoch:
-                        break
-                    pbar.update(batch['image'].shape[0])
-                    continue
+                if gan_enabled:
+                    # ---- Update Discriminator ----
+                    d_optimizer.zero_grad(set_to_none=True)
+                    with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=args.amp):
+                        real_scores = discriminator(real)
+                        fake_scores_d = discriminator(fake.detach())
+                        d_loss = gan_loss.forward_d(real_scores, fake_scores_d)
 
-                d_scaler.scale(d_loss).backward()
-                d_scaler.unscale_(d_optimizer)
-                torch.nn.utils.clip_grad_norm_(discriminator.parameters(), args.grad_clip)
-                d_scaler.step(d_optimizer)
-                d_scaler.update()
+                    if not torch.isfinite(d_loss):
+                        nan_count_in_epoch += 1
+                        logging.warning('NaN d_loss at step %d (epoch %d), rolling back [%d/%d]',
+                                        step, epoch, nan_count_in_epoch, max_nan_per_epoch)
+                        restore_snapshot(snapshot)
+                        if nan_count_in_epoch >= max_nan_per_epoch:
+                            break
+                        pbar.update(batch['image'].shape[0])
+                        continue
 
-                # ---- Update Generator (content + adv + L_WB via GRL) ----
+                    d_scaler.scale(d_loss).backward()
+                    d_scaler.unscale_(d_optimizer)
+                    torch.nn.utils.clip_grad_norm_(discriminator.parameters(), args.grad_clip)
+                    d_scaler.step(d_optimizer)
+                    d_scaler.update()
+
+                    d_loss_value = float(d_loss.item())
+                    d_real_acc, d_fake_acc = compute_d_accuracy(real_scores.detach(), fake_scores_d.detach())
+
+                # ---- Update Generator (content + optional adv + L_WB via GRL) ----
                 g_optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=args.amp):
-                    fake_scores_g = discriminator(fake)
+                    fake_scores_g = discriminator(fake) if gan_enabled else torch.zeros(
+                        1, device=fake.device, dtype=fake.dtype,
+                    )
                     g_loss, metrics = stage3_criterion(outputs, batch, fake_scores_g, epoch)
 
                 if not torch.isfinite(g_loss):
@@ -347,21 +401,22 @@ def train_model(
                 snapshot = take_snapshot()
 
                 # ---- Logging ----
-                d_real_acc, d_fake_acc = compute_d_accuracy(real_scores.detach(), fake_scores_d.detach())
                 step_metrics = {key: float(value.item()) for key, value in metrics.items()}
-                step_metrics['d_loss'] = float(d_loss.item())
+                step_metrics['d_loss'] = d_loss_value
                 step_metrics['d_real_acc'] = d_real_acc
                 step_metrics['d_fake_acc'] = d_fake_acc
+                step_metrics['gan_enabled'] = 1.0 if gan_enabled else 0.0
                 epoch_history.append(step_metrics)
 
                 wb_acc_str = f'{step_metrics.get("wb_classifier_acc", -1):.0%}'
                 pbar.update(batch['image'].shape[0])
                 pbar.set_postfix(
                     g=float(metrics['loss_total'].item()),
-                    d=float(d_loss.item()),
+                    d=d_loss_value,
                     wb=wb_acc_str,
                     dr=f'{d_real_acc:.0%}',
                     df=f'{d_fake_acc:.0%}',
+                    phase='gan' if gan_enabled else 'finetune',
                 )
 
         if nan_count_in_epoch >= max_nan_per_epoch:
@@ -379,7 +434,6 @@ def train_model(
                 old_grl, stage3_criterion.grl_max_lambda,
                 old_wb, stage3_criterion.wb_weight,
             )
-            # Update snapshot to the rolled-back state
             snapshot = take_snapshot()
             if total_reductions >= max_reductions:
                 logging.error('Reached max %d auto-reductions. Saving checkpoint and stopping.', max_reductions)
@@ -393,14 +447,30 @@ def train_model(
                     'args': vars(args),
                     'train_metrics': {},
                     'val_metrics': {},
+                    'gan_enabled': gan_enabled,
+                    'gan_disabled_epoch': gan_disabled_epoch,
+                    'saturation_streak': saturation_streak,
                 }
                 torch.save(recovery, save_dir / 'recovery_before_nan.pth')
                 logging.info('Saved recovery checkpoint to %s', save_dir / 'recovery_before_nan.pth')
                 break
-            continue  # Retry the same epoch with reduced GRL
+            continue
 
         train_metrics = summarize_metrics(epoch_history)
         logging.info('[train] %s', format_metrics(train_metrics))
+
+        if gan_enabled:
+            saturated = (
+                train_metrics.get('d_real_acc', 0.0) >= args.gan_saturation_threshold
+                and train_metrics.get('d_fake_acc', 0.0) >= args.gan_saturation_threshold
+            )
+            saturation_streak = saturation_streak + 1 if saturated else 0
+            stop_by_epoch = args.gan_stop_epoch > 0 and epoch >= args.gan_stop_epoch
+            stop_by_saturation = args.gan_saturation_patience > 0 and saturation_streak >= args.gan_saturation_patience
+            if stop_by_epoch:
+                disable_gan('configured gan_stop_epoch', epoch)
+            elif stop_by_saturation:
+                disable_gan('discriminator saturation', epoch)
 
         # ---- Validation ----
         val_metrics = {}
@@ -422,6 +492,9 @@ def train_model(
             'args': vars(args),
             'train_metrics': train_metrics,
             'val_metrics': val_metrics,
+            'gan_enabled': gan_enabled,
+            'gan_disabled_epoch': gan_disabled_epoch,
+            'saturation_streak': saturation_streak,
         }
         if epoch % args.save_every == 0 or epoch == args.epochs:
             torch.save(checkpoint, save_dir / f'checkpoint_epoch_{epoch:03d}.pth')
@@ -549,6 +622,9 @@ def main():
     # ---- Resume Stage-3 checkpoint if provided ----
     start_epoch = 1
     best_val = float('inf')
+    gan_enabled = True
+    gan_disabled_epoch = None
+    saturation_streak = 0
     if args.resume:
         resume_ckpt = torch.load(args.resume, map_location=device)
         generator.load_state_dict(resume_ckpt['generator_state_dict'], strict=False)
@@ -563,6 +639,9 @@ def main():
         loaded_val = resume_ckpt.get('val_metrics', {})
         if loaded_val:
             best_val = float(loaded_val.get('loss_total', best_val))
+        gan_enabled = bool(resume_ckpt.get('gan_enabled', True))
+        gan_disabled_epoch = resume_ckpt.get('gan_disabled_epoch')
+        saturation_streak = int(resume_ckpt.get('saturation_streak', 0))
         logging.info('Resumed Stage-3 training from %s (epoch %d)', args.resume, start_epoch)
 
     # ---- Dataloaders ----
@@ -612,6 +691,9 @@ def main():
         args=args,
         start_epoch=start_epoch,
         best_val=best_val,
+        gan_enabled=gan_enabled,
+        gan_disabled_epoch=gan_disabled_epoch,
+        saturation_streak=saturation_streak,
     )
 
     if val_loader is None:
