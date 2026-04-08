@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 # Stage-2: PatchGAN 判别器 + 对抗损失
-# 基于 Stage-1 detail_mild 最优权重继续训练
+# 调参版 Exp-1：更稳的 GAN 节奏，输出保存到新目录避免覆盖历史结果
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -16,7 +16,7 @@ VAL_MANIFEST="/home/cavin/CJX/fastMRIdata/MRI_dataset/test_dataset/test_slices/m
 
 # ---- Configurable paths ----
 STAGE1_CKPT="${STAGE1_CKPT:-$REPO_ROOT/checkpoints_stage1_tuning_20260401_163223/detail_mild/best_stage1.pth}"
-SAVE_DIR="${SAVE_DIR:-$REPO_ROOT/checkpoints_stage2}"
+SAVE_DIR="${SAVE_DIR:-$REPO_ROOT/checkpoints_stage2_exp1_20260409}"
 VAL_SAVE_COUNT="${VAL_SAVE_COUNT:-4}"
 
 CMD=(
@@ -34,7 +34,7 @@ CMD=(
   --epochs 50
   --batch-size 8
   --g-lr 1e-4
-  --d-lr 2e-4
+  --d-lr 1.5e-4
 
   # Model (match Stage-1)
   --in-channels 1
@@ -53,9 +53,9 @@ CMD=(
   --bro-weight 0.03
   --irc-weight 0.0
 
-  # Adversarial
-  --adv-weight 1.0
-  --warmup-epochs 5
+  # Adversarial (Exp-1)
+  --adv-weight 0.8
+  --warmup-epochs 8
 
   --save-every 5
   --val-save-count "$VAL_SAVE_COUNT"
@@ -70,7 +70,7 @@ else
 fi
 
 echo "=========================================="
-echo " Stage-2: PatchGAN Adversarial Training"
+echo " Stage-2: PatchGAN Tuning (Exp-1)"
 echo " Stage-1 checkpoint: $STAGE1_CKPT"
 echo " Save directory:     $SAVE_DIR"
 echo "=========================================="
